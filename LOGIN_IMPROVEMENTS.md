@@ -13,7 +13,7 @@ This document outlines the improvements made to fix Puppeteer login timeout issu
 ### 2. Robust Login Flow
 - **Navigation**: Uses both `DOMContentLoaded` and `networkidle2` wait conditions
 - **Redirect Handling**: Automatically detects and follows redirects to `/auth`, `/auth/signin`, or OAuth providers
-- **Retry Mechanism**: Wrapped entire login process with `p-retry` (3 attempts with exponential backoff)
+- **Retry Mechanism**: Wrapped entire login process with internal `withRetry` helper (3 attempts)
 - **Error Recovery**: Page reload on retry attempts
 
 ### 3. Enhanced Selectors
