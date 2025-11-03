@@ -98,7 +98,7 @@ Set `HEADLESS=false` to watch the bot's actions in a visible browser window for 
 - `puppeteer`: Browser automation
 - `puppeteer-extra`: Enhanced Puppeteer functionality
 - `puppeteer-extra-plugin-stealth`: Avoid detection
-- `p-retry`: Retry logic for robustness
+- Internal withRetry helper (no p-retry dependency)
 
 ## License
 
