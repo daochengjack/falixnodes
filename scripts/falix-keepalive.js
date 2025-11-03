@@ -26,11 +26,17 @@ async function withRetry(fn, options) {
 
 puppeteer.use(StealthPlugin());
 
+const DEFAULT_BASE_URL = 'https://client.falixnodes.net';
+const normalizedBaseUrl = (process.env.FALIX_BASE_URL || DEFAULT_BASE_URL).replace(/\/+$/, '');
+const normalizedConsoleUrl = (process.env.FALIX_CONSOLE_URL || `${normalizedBaseUrl}/server/console`).trim();
+
 const config = {
   FALIX_EMAIL: process.env.FALIX_EMAIL,
   FALIX_PASSWORD: process.env.FALIX_PASSWORD,
-  FALIX_BASE_URL: process.env.FALIX_BASE_URL || 'https://client.falixnodes.net',
-  FALIX_SERVER_HOST: process.env.FALIX_SERVER_HOST || 'mikeqd.falixsrv.me',
+  FALIX_BASE_URL: normalizedBaseUrl,
+  FALIX_SERVER_HOST: (process.env.FALIX_SERVER_HOST || 'mikeqd.falixsrv.me').trim(),
+  FALIX_SERVER_NAME: (process.env.FALIX_SERVER_NAME || '').trim(),
+  FALIX_CONSOLE_URL: normalizedConsoleUrl,
   CHECK_INTERVAL_MS: parseInt(process.env.CHECK_INTERVAL_MS) || 120000,
   AD_WATCH_MS: parseInt(process.env.AD_WATCH_MS) || 35000,
   HEADLESS: process.env.HEADLESS !== 'false'
@@ -473,107 +479,554 @@ async function handleCloudflareVerification() {
   return handleEnhancedCloudflareVerification();
 }
 
-async function checkServerStatus() {
-  console.log(`Checking server status for ${config.FALIX_SERVER_HOST}...`);
-  try {
-    await gotoWithRetry(`${config.FALIX_BASE_URL}/`);
-    
-    await handleEnhancedCloudflareVerification();
-    
-    await page.waitForTimeout(3000);
-    
-    const serverStatus = await page.evaluate((serverHost) => {
-      const allText = document.body.textContent || document.body.innerText || '';
-      
-      if (!allText.includes(serverHost)) {
-        return { found: false, reason: 'Server not found on page' };
+function normalizeWhitespace(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function uniqueStrings(values = []) {
+  const seen = new Set();
+  const result = [];
+
+  for (const value of values) {
+    if (!value) continue;
+    const normalized = normalizeWhitespace(value);
+    if (!normalized) continue;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(normalized);
+  }
+
+  return result;
+}
+
+function extractHostCandidates(...sources) {
+  const hostRegex = /([a-z0-9-]+\.)+[a-z]{2,}/gi;
+  const hosts = new Set();
+
+  for (const source of sources) {
+    if (!source) continue;
+    const text = Array.isArray(source) ? source.join(' ') : String(source);
+    let match;
+    while ((match = hostRegex.exec(text)) !== null) {
+      const host = match[0].toLowerCase();
+      if (!host.includes(' ')) {
+        hosts.add(host);
       }
-      
-      const serverElements = document.querySelectorAll('*');
-      for (const element of serverElements) {
-        const text = element.textContent || '';
-        if (text.includes(serverHost)) {
-          const parent = element.closest('tr, .server-item, .server-card, .card, .list-item, div[class*="server"]');
-          if (parent) {
-            const statusElements = parent.querySelectorAll('*');
-            for (const statusEl of statusElements) {
-              const statusText = (statusEl.textContent || '').toLowerCase();
-              const statusClasses = (statusEl.className || '').toLowerCase();
-              
-              if (statusText.includes('offline') || statusText.includes('stopped') || statusText.includes('down') ||
-                  statusClasses.includes('offline') || statusClasses.includes('stopped') || statusClasses.includes('down')) {
-                return { found: true, isOffline: true, statusText: statusText };
-              }
-              
-              if (statusText.includes('online') || statusText.includes('running') || statusText.includes('active') ||
-                  statusClasses.includes('online') || statusClasses.includes('running') || statusClasses.includes('active')) {
-                return { found: true, isOffline: false, statusText: statusText };
-              }
-            }
-          }
-        }
-      }
-      
-      return { found: true, isOffline: false, statusText: 'Unknown - assuming online' };
-    }, config.FALIX_SERVER_HOST);
-    
-    if (!serverStatus.found) {
-      console.log(`Server ${config.FALIX_SERVER_HOST} not found on dashboard: ${serverStatus.reason}`);
-      return false;
     }
-    
-    console.log(`Server status: ${serverStatus.statusText}`);
-    return serverStatus.isOffline;
+  }
+
+  return Array.from(hosts);
+}
+
+function determineStatusFromIndicators({ statusCandidates = [], buttonTexts = [], explicitStartButtons = 0, explicitStopButtons = 0 }) {
+  const combined = uniqueStrings([...statusCandidates, ...buttonTexts]);
+  const lowerCombined = combined.map(text => text.toLowerCase());
+
+  const hasStartControl = explicitStartButtons > 0 || lowerCombined.some(text => text.includes('start') || text.includes('power on') || text.includes('boot'));
+  const hasStopControl = explicitStopButtons > 0 || lowerCombined.some(text => text.includes('stop') || text.includes('power off') || text.includes('shutdown'));
+
+  const offlineKeywords = ['offline', 'stopped', 'stopping', 'down', 'idle', 'not running', 'power off', 'start server'];
+  const onlineKeywords = ['online', 'running', 'active', 'started', 'up', 'powered on', 'stop server'];
+
+  const offlineText = combined.find(text => offlineKeywords.some(keyword => text.toLowerCase().includes(keyword)));
+  const onlineText = combined.find(text => onlineKeywords.some(keyword => text.toLowerCase().includes(keyword)));
+
+  let isOffline = null;
+  let statusText = null;
+
+  if (offlineText && !onlineText) {
+    isOffline = true;
+    statusText = offlineText;
+  } else if (onlineText && !offlineText) {
+    isOffline = false;
+    statusText = onlineText;
+  }
+
+  if (isOffline === null) {
+    if (hasStopControl && !hasStartControl) {
+      isOffline = false;
+      statusText = statusText || 'Stop control visible';
+    } else if (hasStartControl && !hasStopControl) {
+      isOffline = true;
+      statusText = statusText || 'Start control visible';
+    } else if (hasStartControl && hasStopControl) {
+      if (onlineText) {
+        isOffline = false;
+        statusText = onlineText;
+      } else if (offlineText) {
+        isOffline = true;
+        statusText = offlineText;
+      }
+    }
+  }
+
+  if (isOffline === null) {
+    if (onlineText) {
+      isOffline = false;
+      statusText = onlineText;
+    } else if (offlineText) {
+      isOffline = true;
+      statusText = offlineText;
+    }
+  }
+
+  if (isOffline === null) {
+    isOffline = false;
+    statusText = statusText || 'Status unknown - assuming online';
+  }
+
+  return {
+    isOffline,
+    statusText,
+    hasStartControl,
+    hasStopControl,
+    combinedTexts: combined
+  };
+}
+
+function logServerEntries(entries) {
+  console.log('\n=== Detected servers on dashboard ===');
+  if (!entries.length) {
+    console.log('No servers found on dashboard');
+  } else {
+    entries.forEach((entry, index) => {
+      const host = entry.hostCandidates[0] || 'N/A';
+      const name = entry.nameCandidates[0] || 'N/A';
+      const statusInfo = determineStatusFromIndicators({
+        statusCandidates: entry.statusCandidates,
+        buttonTexts: entry.buttonTexts
+      });
+      console.log(`${index + 1}. Host: ${host} | Name: ${name} | Status: ${statusInfo.statusText}`);
+    });
+  }
+  console.log('=====================================\n');
+}
+
+async function attemptConsoleDetection() {
+  if (!config.FALIX_CONSOLE_URL) {
+    return { success: false, reason: 'Console URL not configured' };
+  }
+
+  console.log(`Attempting direct console navigation to ${config.FALIX_CONSOLE_URL}...`);
+
+  try {
+    await gotoWithRetry(config.FALIX_CONSOLE_URL);
+    await handleEnhancedCloudflareVerification();
+    await page.waitForTimeout(2000);
+
+    const consoleData = await page.evaluate(() => {
+      const getText = (element) => {
+        if (!element) return '';
+        const content = element.innerText || element.textContent || '';
+        return content.trim();
+      };
+
+      const collect = (selectors) => {
+        const values = [];
+        selectors.forEach(selector => {
+          document.querySelectorAll(selector).forEach(node => {
+            const value = getText(node);
+            if (value) {
+              values.push(value);
+            }
+          });
+        });
+        return values;
+      };
+
+      const headerSelectors = ['.server-header', '.server-title', '.server-name', '.server-heading', '[data-testid*="server-name"]', 'h1', 'h2', 'h3'];
+      const hostSelectors = ['.server-host', '.server-address', '.hostname', '[data-testid*="host"]', '[data-testid*="address"]'];
+      const statusSelectors = ['.status', '.badge', '.state', '.label', '[class*="status"]', '[data-testid*="status"]', '[class*="state"]'];
+
+      const buttonNodes = document.querySelectorAll('button, .btn, input[type="button"], input[type="submit"], a[role="button"]');
+      const buttonTexts = [];
+      let startButtons = 0;
+      let stopButtons = 0;
+
+      buttonNodes.forEach(btn => {
+        const text = getText(btn).toLowerCase();
+        if (!text) return;
+        buttonTexts.push(text);
+        if (text.includes('start') || text.includes('power on') || text.includes('boot')) {
+          startButtons += 1;
+        }
+        if (text.includes('stop') || text.includes('power off') || text.includes('shutdown')) {
+          stopButtons += 1;
+        }
+      });
+
+      const contentRoot = document.querySelector('main') || document.querySelector('#app') || document.body;
+      const rawLines = (getText(contentRoot) || '')
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0)
+        .slice(0, 100);
+
+      return {
+        headerSegments: collect(headerSelectors),
+        hostSegments: collect(hostSelectors),
+        statusSegments: collect(statusSelectors),
+        buttonTexts,
+        startButtons,
+        stopButtons,
+        rawLines
+      };
+    });
+
+    const headerCandidates = uniqueStrings(consoleData.headerSegments.concat(consoleData.rawLines.slice(0, 10)));
+    const hostCandidates = uniqueStrings(consoleData.hostSegments.concat(extractHostCandidates(consoleData.rawLines, consoleData.headerSegments)));
+    const statusIndicators = uniqueStrings(consoleData.statusSegments.concat(consoleData.rawLines.filter(line => /online|offline|running|stopped|down|idle/i.test(line.toLowerCase()))));
+
+    const statusInfo = determineStatusFromIndicators({
+      statusCandidates: statusIndicators,
+      buttonTexts: consoleData.buttonTexts,
+      explicitStartButtons: consoleData.startButtons,
+      explicitStopButtons: consoleData.stopButtons
+    });
+
+    const normalizedTargetHost = config.FALIX_SERVER_HOST.toLowerCase();
+    const normalizedTargetName = config.FALIX_SERVER_NAME.toLowerCase();
+
+    const matchedByHost = normalizedTargetHost && hostCandidates.some(host => host.toLowerCase() === normalizedTargetHost);
+    const matchedByName = normalizedTargetName && headerCandidates.some(name => name.toLowerCase() === normalizedTargetName);
+
+    console.log(`Console host candidates: ${hostCandidates.join(', ') || 'none'}`);
+    console.log(`Console name candidates: ${headerCandidates.join(', ') || 'none'}`);
+    console.log(`Console status indicators: ${statusInfo.combinedTexts.join(', ') || 'none'}`);
+
+    if (!matchedByHost && !matchedByName) {
+      console.log('Console validation: unable to match configured server by host or name');
+      await captureDiagnosticInfo('console-validation-mismatch');
+      return { success: false, reason: 'Console page did not match configured server' };
+    }
+
+    const matchedBy = matchedByHost ? 'host' : 'name';
+    console.log(`Console detection matched by ${matchedBy}. Status: ${statusInfo.statusText}`);
+
+    return {
+      success: true,
+      matchedBy,
+      isOffline: statusInfo.isOffline,
+      statusText: statusInfo.statusText
+    };
+  } catch (error) {
+    console.error(`Console detection failed: ${error.message}`);
+    await captureDiagnosticInfo('console-direct-link-error');
+    return { success: false, reason: error.message };
+  }
+}
+
+async function loadAllServersOnDashboard() {
+  let previousHeight = 0;
+  for (let i = 0; i < 8; i++) {
+    const currentHeight = await page.evaluate(() => document.body ? document.body.scrollHeight : 0);
+    if (currentHeight <= previousHeight) {
+      break;
+    }
+    previousHeight = currentHeight;
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    try {
+      await page.waitForNetworkIdle({ idleTime: 750, timeout: 5000 });
+    } catch (error) {
+      // Ignore network idle timeouts
+    }
+    await page.waitForTimeout(1000);
+  }
+
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.waitForTimeout(500);
+}
+
+async function collectServersFromDashboard() {
+  const rawEntries = await page.evaluate(() => {
+    const unique = (values = []) => {
+      const seen = new Set();
+      const result = [];
+      for (const value of values) {
+        if (!value) continue;
+        const normalized = value.replace(/\s+/g, ' ').trim();
+        if (!normalized) continue;
+        const key = normalized.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        result.push(normalized);
+      }
+      return result;
+    };
+
+    const candidateSelectors = [
+      '.server-card',
+      '.server-item',
+      '.server-row',
+      '.server-box',
+      '.servers-list .card',
+      '.servers-list li',
+      'tr',
+      '.card',
+      'div[class*="server"]',
+      'li[class*="server"]',
+      '.list-item'
+    ];
+
+    const nodes = new Set();
+    candidateSelectors.forEach(selector => {
+      document.querySelectorAll(selector).forEach(node => nodes.add(node));
+    });
+
+    const entries = [];
+
+    Array.from(nodes).forEach(node => {
+      const textContent = node.innerText || node.textContent || '';
+      if (!textContent) return;
+
+      const trimmed = textContent.trim();
+      if (!trimmed) return;
+
+      const hostMatches = trimmed.match(/([a-z0-9-]+\.)+[a-z]{2,}/gi) || [];
+      const lower = trimmed.toLowerCase();
+      const hasKeyword = lower.includes('server') || lower.includes('online') || lower.includes('offline') || lower.includes('start') || lower.includes('stop');
+
+      if (!hostMatches.length && !hasKeyword) {
+        return;
+      }
+
+      const collect = (selectors) => {
+        const values = [];
+        selectors.forEach(selector => {
+          node.querySelectorAll(selector).forEach(el => {
+            const value = (el.innerText || el.textContent || '').trim();
+            if (value) {
+              values.push(value);
+            }
+          });
+        });
+        return values;
+      };
+
+      const nameSelectors = ['.server-name', '.name', '.title', '.card-title', 'h1', 'h2', 'h3', 'strong', '[data-testid*="server-name"]'];
+      const hostSelectors = ['.server-host', '.hostname', '.address', '[data-testid*="host"]', '[data-testid*="address"]'];
+      const statusSelectors = ['.status', '.badge', '.state', '.label', '[class*="status"]', '[class*="state"]'];
+      const buttonSelectors = ['button', '.btn', 'a[role="button"]'];
+
+      const rawLines = trimmed.split('\n').map(line => line.trim()).filter(line => line.length > 0).slice(0, 10);
+
+      entries.push({
+        nameCandidates: unique([...collect(nameSelectors), ...rawLines.slice(0, 2)]),
+        hostCandidates: unique([...collect(hostSelectors), ...hostMatches]),
+        statusCandidates: unique([...collect(statusSelectors), ...rawLines.filter(line => /online|offline|running|stopped|down|idle/i.test(line.toLowerCase()))]),
+        buttonTexts: unique(collect(buttonSelectors)),
+        rawLines,
+        rawText: trimmed.slice(0, 500)
+      });
+    });
+
+    return entries;
+  });
+
+  return rawEntries.map(entry => {
+    const hostAugments = extractHostCandidates(entry.hostCandidates, entry.rawLines, entry.rawText);
+    const lineStatus = entry.rawLines.filter(line => /online|offline|running|stopped|down|idle/i.test(line.toLowerCase()));
+
+    return {
+      nameCandidates: uniqueStrings([...entry.nameCandidates, ...entry.rawLines.slice(0, 3)]),
+      host_candidates: uniqueStrings([...entry.hostCandidates, ...hostAugments]),
+      statusCandidates: uniqueStrings([...entry.statusCandidates, ...lineStatus]),
+      buttonTexts: uniqueStrings(entry.buttonTexts),
+      rawLines: uniqueStrings(entry.rawLines),
+      rawText: entry.rawText
+    };
+  }).map(entry => ({
+    ...entry,
+    hostCandidates: entry.host_candidates,
+    host_candidates: undefined
+  }));
+}
+
+function findServerMatch(entries) {
+  const targetHost = config.FALIX_SERVER_HOST.toLowerCase();
+  const targetName = config.FALIX_SERVER_NAME.toLowerCase();
+
+  for (const entry of entries) {
+    const hostMatches = targetHost && entry.hostCandidates.some(host => host.toLowerCase() === targetHost);
+    const nameMatches = targetName && entry.nameCandidates.some(name => name.toLowerCase() === targetName);
+
+    if (hostMatches || nameMatches) {
+      return {
+        entry,
+        matchedBy: hostMatches ? 'host' : 'name'
+      };
+    }
+  }
+
+  return null;
+}
+
+async function detectServerViaDashboard() {
+  console.log('Falling back to dashboard server detection...');
+
+  await gotoWithRetry(`${config.FALIX_BASE_URL}/`);
+  await handleEnhancedCloudflareVerification();
+  await page.waitForTimeout(2000);
+  await loadAllServersOnDashboard();
+
+  const entries = await collectServersFromDashboard();
+
+  if (!entries.length) {
+    console.error('No server entries detected on dashboard');
+    await captureDiagnosticInfo('server-list-empty');
+    throw new Error('No server entries detected on dashboard');
+  }
+
+  logServerEntries(entries);
+
+  const match = findServerMatch(entries);
+  if (!match) {
+    console.error('Configured server not found on dashboard');
+    await captureDiagnosticInfo('server-not-found');
+    throw new Error(`Server not found. Host: ${config.FALIX_SERVER_HOST}${config.FALIX_SERVER_NAME ? `, Name: ${config.FALIX_SERVER_NAME}` : ''}`);
+  }
+
+  const statusInfo = determineStatusFromIndicators({
+    statusCandidates: match.entry.statusCandidates,
+    buttonTexts: match.entry.buttonTexts
+  });
+
+  console.log(`Matched dashboard server by ${match.matchedBy}. Status: ${statusInfo.statusText}`);
+
+  return {
+    isOffline: statusInfo.isOffline,
+    statusText: statusInfo.statusText,
+    matchedBy: match.matchedBy
+  };
+}
+
+async function checkServerStatus() {
+  const targetDescription = config.FALIX_SERVER_NAME
+    ? `${config.FALIX_SERVER_NAME} (${config.FALIX_SERVER_HOST})`
+    : config.FALIX_SERVER_HOST;
+  console.log(`Checking server status for ${targetDescription}...`);
+
+  try {
+    const consoleResult = await attemptConsoleDetection();
+    if (consoleResult.success) {
+      return consoleResult.isOffline;
+    }
+
+    console.log(`Console detection unavailable: ${consoleResult.reason}`);
+    const dashboardResult = await detectServerViaDashboard();
+    return dashboardResult.isOffline;
   } catch (error) {
     console.error('Error checking server status:', error.message);
     await captureDiagnosticInfo('server-status-error');
-    return false;
+    throw error;
   }
 }
 
 async function startServer() {
   console.log('Server is offline, attempting to start...');
   try {
-    await gotoWithRetry(`${config.FALIX_BASE_URL}/server/console`);
-    
+    await gotoWithRetry(config.FALIX_CONSOLE_URL);
     await handleEnhancedCloudflareVerification();
-    
-    await page.waitForTimeout(2000);
-    
-    const startButton = await page.evaluate(() => {
-      const buttons = document.querySelectorAll('button, .btn, input[type="button"], input[type="submit"]');
-      for (const btn of buttons) {
-        const text = btn.textContent.toLowerCase();
-        if (text.includes('start') || text.includes('run') || text.includes('launch')) {
-          btn.click();
+    await page.waitForTimeout(1500);
+
+    const startClicked = await page.evaluate(() => {
+      const selectorCandidates = [
+        'button[data-action="start"]',
+        'button[aria-label*="start" i]',
+        'button[class*="start" i]',
+        '.btn-start',
+        '[data-testid*="start"]',
+        'button[name*="start" i]'
+      ];
+
+      for (const selector of selectorCandidates) {
+        const element = document.querySelector(selector);
+        if (element && typeof element.click === 'function') {
+          element.click();
           return true;
         }
       }
+
+      const candidates = document.querySelectorAll('button, .btn, input[type="button"], input[type="submit"], a[role="button"]');
+      for (const element of candidates) {
+        const text = (element.innerText || element.textContent || element.value || '').trim().toLowerCase();
+        if (!text) continue;
+        if (text.includes('start') || text.includes('power on') || text.includes('launch') || text.includes('boot')) {
+          if (typeof element.click === 'function') {
+            element.click();
+            return true;
+          }
+        }
+      }
+
       return false;
     });
-    
-    if (!startButton) {
-      console.log('Start button not found, trying alternative selectors...');
-      await page.click('button[class*="start"], .btn-start, [data-action="start"], input[value*="Start"]');
+
+    if (!startClicked) {
+      throw new Error('Start button not found on console page');
     }
-    console.log('Start button clicked');
-    
+
+    console.log('Start command issued, handling potential ad modal...');
     await handleAdModal();
-    
-    console.log('Waiting for server to start...');
+
+    console.log('Waiting for server to come online...');
     await page.waitForTimeout(5000);
-    
-    const isStarted = await checkServerStarted();
-    if (isStarted) {
-      console.log('Server started successfully');
+
+    const statusData = await page.evaluate(() => {
+      const getText = (el) => (el ? (el.innerText || el.textContent || '').trim() : '');
+      const statusNodes = document.querySelectorAll('.status, .badge, .state, .label, [class*="status"], [class*="state"]');
+      const buttonNodes = document.querySelectorAll('button, .btn, input[type="button"], input[type="submit"], a[role="button"]');
+
+      const statusCandidates = [];
+      statusNodes.forEach(node => {
+        const text = getText(node);
+        if (text) statusCandidates.push(text);
+      });
+
+      const buttonTexts = [];
+      let startButtons = 0;
+      let stopButtons = 0;
+      buttonNodes.forEach(node => {
+        const text = getText(node).toLowerCase();
+        if (!text) return;
+        buttonTexts.push(text);
+        if (text.includes('start') || text.includes('power on') || text.includes('boot')) startButtons += 1;
+        if (text.includes('stop') || text.includes('power off') || text.includes('shutdown')) stopButtons += 1;
+      });
+
+      const summaryLines = (getText(document.querySelector('main')) || getText(document.body))
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0)
+        .slice(0, 20);
+
+      return { statusCandidates, buttonTexts, startButtons, stopButtons, summaryLines };
+    });
+
+    const postStatus = determineStatusFromIndicators({
+      statusCandidates: uniqueStrings([...statusData.statusCandidates, ...statusData.summaryLines]),
+      buttonTexts: uniqueStrings(statusData.buttonTexts),
+      explicitStartButtons: statusData.startButtons,
+      explicitStopButtons: statusData.stopButtons
+    });
+
+    console.log(`Post-start status: ${postStatus.statusText}`);
+
+    if (postStatus.isOffline) {
+      console.log('Server start initiated, but status still appears offline. Will continue monitoring in next cycle.');
     } else {
-      console.log('Server start initiated, but status not yet updated');
+      console.log('Server started successfully');
     }
   } catch (error) {
     console.error('Error starting server:', error.message);
     await captureDiagnosticInfo('start-server-error');
   }
 }
+
 
 async function handleAdModal() {
   console.log('Checking for ad modal...');
