@@ -25,6 +25,8 @@ Add the following secrets to your GitHub repository:
 **Optional:**
 - `FALIX_BASE_URL`: Base URL (default: `https://client.falixnodes.net`)
 - `FALIX_SERVER_HOST`: Server hostname to monitor (default: `mikeqd.falixsrv.me`)
+- `FALIX_SERVER_NAME`: Server display name for matching (alternative/additional to host)
+- `FALIX_CONSOLE_URL`: Direct console URL to bypass dashboard (default: `<BASE_URL>/server/console`)
 - `CHECK_INTERVAL_MS`: Check interval in milliseconds (default: `120000`)
 - `AD_WATCH_MS`: Ad watch duration in milliseconds (default: `35000`)
 - `HEADLESS`: Run in headless mode (default: `true`)
@@ -67,6 +69,8 @@ The workflow is configured to:
 | `FALIX_PASSWORD` | - | Your Falix account password (required) |
 | `FALIX_BASE_URL` | `https://client.falixnodes.net` | Falix client base URL |
 | `FALIX_SERVER_HOST` | `mikeqd.falixsrv.me` | Server hostname to monitor |
+| `FALIX_SERVER_NAME` | - | Server display name for matching (optional) |
+| `FALIX_CONSOLE_URL` | `<BASE_URL>/server/console` | Direct console URL to bypass dashboard (optional) |
 | `CHECK_INTERVAL_MS` | `120000` | Interval between checks in milliseconds (2 minutes) |
 | `AD_WATCH_MS` | `35000` | Duration to wait for ads in milliseconds (35 seconds) |
 | `HEADLESS` | `true` | Whether to run browser in headless mode |
@@ -75,10 +79,21 @@ The workflow is configured to:
 
 1. **Login**: The bot logs into your Falix account using the provided credentials
 2. **Cloudflare Handling**: If Cloudflare verification appears, it waits for it to complete
-3. **Status Check**: Navigates to the dashboard and checks if the specified server is offline
-4. **Auto-Start**: If the server is offline, it navigates to the console and clicks Start
-5. **Ad Handling**: If an ad modal appears, it watches the ad for the specified duration
-6. **Monitoring**: Continues checking every 2 minutes for the duration of the workflow
+3. **Server Detection** (two strategies):
+   - **Direct Console**: If `FALIX_CONSOLE_URL` is explicitly provided, navigates directly to console and validates by checking for Start/Stop controls and matching server name/host
+   - **Dashboard Fallback**: If direct console fails or not configured, navigates to dashboard, scrolls to load all servers, collects server cards/rows, and matches by exact host (`FALIX_SERVER_HOST`) or display name (`FALIX_SERVER_NAME`, case-insensitive)
+4. **Status Check**: Determines if server is offline by analyzing status indicators, button controls, and text content
+5. **Auto-Start**: If the server is offline, navigates to console and clicks Start
+6. **Ad Handling**: If an ad modal appears, watches the ad for the specified duration
+7. **Monitoring**: Continues checking every 2 minutes for the duration of the workflow
+
+### Server Matching
+
+The bot can match servers by:
+- **Host**: Exact match of `FALIX_SERVER_HOST` (e.g., `mikeqd.falixsrv.me`)
+- **Display Name**: Case-insensitive match of `FALIX_SERVER_NAME` (e.g., `My Server`)
+
+When a server is not found, the bot logs all detected servers with their hosts, names, and statuses for troubleshooting.
 
 ## Troubleshooting
 
