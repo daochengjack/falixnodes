@@ -1,0 +1,39 @@
+name: Falix Keepalive Bot
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    strategy:
+      matrix:
+        node-version: [20.x]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run Falix keepalive bot
+      env:
+        FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
+        FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
+        FALIX_BASE_URL: ${{ secrets.FALIX_BASE_URL || 'https://client.falixnodes.net' }}
+        FALIX_SERVER_HOST: ${{ secrets.FALIX_SERVER_HOST || 'mikeqd.falixsrv.me' }}
+        CHECK_INTERVAL_MS: ${{ secrets.CHECK_INTERVAL_MS || '120000' }}
+        AD_WATCH_MS: ${{ secrets.AD_WATCH_MS || '35000' }}
+        HEADLESS: ${{ secrets.HEADLESS || 'true' }}
+      run: npm run keepalive

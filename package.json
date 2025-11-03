@@ -1,0 +1,18 @@
+{
+  "name": "falix-keepalive-bot",
+  "version": "1.0.0",
+  "description": "Automated Falix server keep-alive bot with CI workflow",
+  "main": "scripts/falix-keepalive.js",
+  "scripts": {
+    "keepalive": "node scripts/falix-keepalive.js"
+  },
+  "dependencies": {
+    "puppeteer": "^21.5.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "p-retry": "^5.1.2"
+  },
+  "keywords": ["falix", "keepalive", "bot", "automation"],
+  "author": "",
+  "license": "MIT"
+}
