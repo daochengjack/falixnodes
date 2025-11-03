@@ -77,12 +77,19 @@ async function captureDiagnosticInfo(context) {
     
     console.log(`Diagnostic info captured: ${screenshotPath}, ${htmlPath}`);
     console.log(`Current URL: ${page.url()}`);
+    console.log(`waitUntil config used: ['domcontentloaded', 'networkidle0']`);
     
     // Log available frames
     const frames = page.frames();
     console.log(`Available frames: ${frames.length}`);
     frames.forEach((frame, i) => {
-      console.log(`  Frame ${i}: ${frame.url()}`);
+      if (frame && frame.url) {
+        try {
+          console.log(`  Frame ${i}: ${frame.url()}`);
+        } catch (err) {
+          console.log(`  Frame ${i}: <unable to access frame URL>`);
+        }
+      }
     });
     
     return { screenshotPath, htmlPath };
@@ -122,12 +129,17 @@ async function findElementInFrames(selectors) {
   
   // Try all frames
   for (const frame of frames) {
+    // Guard: check if frame is valid and accessible
+    if (!frame || frame.detached()) {
+      continue;
+    }
+    
     for (const selector of selectors) {
       try {
         const element = await frame.$(selector);
         if (element) return { frame, selector };
       } catch (error) {
-        // Continue
+        // Continue - frame might be inaccessible
       }
     }
   }
@@ -170,7 +182,7 @@ async function handleRedirects() {
     });
     
     if (loginButtonFound) {
-      await page.waitForNavigation({ waitUntil: 'networkidle2' });
+      await page.waitForNavigation({ waitUntil: ['domcontentloaded', 'networkidle0'] });
       console.log('Clicked login button by text content');
       return true;
     }
@@ -179,7 +191,7 @@ async function handleRedirects() {
       try {
         await page.waitForSelector(selector, { timeout: 5000 });
         await Promise.all([
-          page.waitForNavigation({ waitUntil: 'networkidle2' }),
+          page.waitForNavigation({ waitUntil: ['domcontentloaded', 'networkidle0'] }),
           page.click(selector)
         ]);
         console.log(`Clicked login element: ${selector}`);
@@ -199,9 +211,41 @@ async function login() {
     
     try {
       // Navigate to login page with better wait conditions
-      await page.goto(`${config.FALIX_BASE_URL}/auth/login`, { 
-        waitUntil: ['DOMContentLoaded', 'networkidle2'],
-        timeout: 45000 
+      const loginUrl = `${config.FALIX_BASE_URL}/auth/login`;
+      console.log(`Navigating to: ${loginUrl} with waitUntil: ['domcontentloaded', 'networkidle0']`);
+      
+      await withRetry(async () => {
+        await page.goto(loginUrl, { 
+          waitUntil: ['domcontentloaded', 'networkidle0'],
+          timeout: 60000 
+        });
+        
+        // Check if stuck at about:blank
+        const currentUrl = page.url();
+        console.log(`Navigation completed, current URL: ${currentUrl}`);
+        
+        if (currentUrl === 'about:blank') {
+          console.log('Stuck at about:blank, will retry...');
+          throw new Error('Navigation stuck at about:blank');
+        }
+        
+        if (!currentUrl.includes(config.FALIX_BASE_URL.replace('https://', '').replace('http://', ''))) {
+          console.log(`Warning: Current URL (${currentUrl}) doesn't match expected base URL`);
+        }
+      }, {
+        retries: 2,
+        onFailedAttempt: async (error) => {
+          console.log(`Navigation attempt ${error.attemptNumber} failed: ${error.message}. ${error.retriesLeft} retries left.`);
+          console.log(`Current URL before retry: ${page.url()}`);
+          if (error.attemptNumber > 1) {
+            try {
+              console.log('Attempting page.reload() fallback...');
+              await page.reload({ waitUntil: ['domcontentloaded', 'networkidle0'], timeout: 60000 });
+            } catch (reloadError) {
+              console.log(`Reload failed: ${reloadError.message}`);
+            }
+          }
+        }
       });
       
       // Handle potential redirects
@@ -285,8 +329,9 @@ async function login() {
       await passwordElement.frame.type(passwordElement.selector, config.FALIX_PASSWORD);
       
       // Submit the form
+      console.log('Submitting login form with waitUntil: [\'domcontentloaded\', \'networkidle0\']');
       await Promise.all([
-        emailElement.frame.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 }),
+        emailElement.frame.waitForNavigation({ waitUntil: ['domcontentloaded', 'networkidle0'], timeout: 60000 }),
         emailElement.frame.click(submitElement.selector)
       ]);
       
@@ -354,12 +399,21 @@ async function handleEnhancedCloudflareVerification() {
       // Check iframes for verification challenges
       const frames = page.frames();
       for (const frame of frames) {
-        const frameUrl = frame.url();
-        if (frameUrl.includes('turnstile') || frameUrl.includes('hcaptcha') || 
-            frameUrl.includes('challenge') || frameUrl.includes('cf-')) {
-          console.log(`Verification detected in iframe: ${frameUrl}`);
-          verificationDetected = true;
-          break;
+        // Guard: check if frame is valid and accessible
+        if (!frame || frame.detached()) {
+          continue;
+        }
+        
+        try {
+          const frameUrl = frame.url();
+          if (frameUrl.includes('turnstile') || frameUrl.includes('hcaptcha') || 
+              frameUrl.includes('challenge') || frameUrl.includes('cf-')) {
+            console.log(`Verification detected in iframe: ${frameUrl}`);
+            verificationDetected = true;
+            break;
+          }
+        } catch (error) {
+          // Frame might be inaccessible, continue
         }
       }
       
@@ -423,10 +477,13 @@ async function handleCloudflareVerification() {
 async function checkServerStatus() {
   console.log(`Checking server status for ${config.FALIX_SERVER_HOST}...`);
   try {
-    await page.goto(`${config.FALIX_BASE_URL}/`, { 
-      waitUntil: ['DOMContentLoaded', 'networkidle2'],
-      timeout: 45000 
+    const dashboardUrl = `${config.FALIX_BASE_URL}/`;
+    console.log(`Navigating to dashboard: ${dashboardUrl} with waitUntil: ['domcontentloaded', 'networkidle0']`);
+    await page.goto(dashboardUrl, { 
+      waitUntil: ['domcontentloaded', 'networkidle0'],
+      timeout: 60000 
     });
+    console.log(`Dashboard loaded, current URL: ${page.url()}`);
     
     await handleEnhancedCloudflareVerification();
     
@@ -484,10 +541,13 @@ async function checkServerStatus() {
 async function startServer() {
   console.log('Server is offline, attempting to start...');
   try {
-    await page.goto(`${config.FALIX_BASE_URL}/server/console`, { 
-      waitUntil: ['DOMContentLoaded', 'networkidle2'],
-      timeout: 45000 
+    const consoleUrl = `${config.FALIX_BASE_URL}/server/console`;
+    console.log(`Navigating to console: ${consoleUrl} with waitUntil: ['domcontentloaded', 'networkidle0']`);
+    await page.goto(consoleUrl, { 
+      waitUntil: ['domcontentloaded', 'networkidle0'],
+      timeout: 60000 
     });
+    console.log(`Console loaded, current URL: ${page.url()}`);
     
     await handleEnhancedCloudflareVerification();
     
