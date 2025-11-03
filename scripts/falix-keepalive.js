@@ -1,6 +1,7 @@
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const pRetry = require('p-retry');
+const fs = require('fs');
 
 puppeteer.use(StealthPlugin());
 
@@ -25,7 +26,7 @@ let page;
 async function initializeBrowser() {
   console.log('Initializing browser...');
   browser = await puppeteer.launch({
-    headless: config.HEADLESS,
+    headless: config.HEADLESS ? "new" : false,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -39,53 +40,382 @@ async function initializeBrowser() {
   });
   
   page = await browser.newPage();
-  await page.setViewport({ width: 1280, height: 720 });
+  await page.setViewport({ width: 1366, height: 768 });
   
-  page.setDefaultTimeout(30000);
-  page.setDefaultNavigationTimeout(30000);
+  // Set realistic user agent
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  
+  page.setDefaultTimeout(45000);
+  page.setDefaultNavigationTimeout(45000);
+}
+
+async function captureDiagnosticInfo(context) {
+  try {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const screenshotPath = `/tmp/falix-${context}-${timestamp}.png`;
+    const htmlPath = `/tmp/falix-${context}-${timestamp}.html`;
+    
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    const html = await page.content();
+    fs.writeFileSync(htmlPath, html);
+    
+    console.log(`Diagnostic info captured: ${screenshotPath}, ${htmlPath}`);
+    console.log(`Current URL: ${page.url()}`);
+    
+    // Log available frames
+    const frames = page.frames();
+    console.log(`Available frames: ${frames.length}`);
+    frames.forEach((frame, i) => {
+      console.log(`  Frame ${i}: ${frame.url()}`);
+    });
+    
+    return { screenshotPath, htmlPath };
+  } catch (error) {
+    console.error('Failed to capture diagnostic info:', error.message);
+  }
+}
+
+async function waitForSelectorWithFallbacks(selectors, options = {}) {
+  const timeout = options.timeout || 45000;
+  
+  for (const selector of selectors) {
+    try {
+      console.log(`Trying selector: ${selector}`);
+      await page.waitForSelector(selector, { timeout: Math.min(timeout / selectors.length, 10000) });
+      console.log(`Found element with selector: ${selector}`);
+      return selector;
+    } catch (error) {
+      console.log(`Selector ${selector} not found: ${error.message}`);
+    }
+  }
+  throw new Error(`None of the selectors were found: ${selectors.join(', ')}`);
+}
+
+async function findElementInFrames(selectors) {
+  const frames = page.frames();
+  
+  // Try main page first
+  for (const selector of selectors) {
+    try {
+      const element = await page.$(selector);
+      if (element) return { frame: page, selector };
+    } catch (error) {
+      // Continue
+    }
+  }
+  
+  // Try all frames
+  for (const frame of frames) {
+    for (const selector of selectors) {
+      try {
+        const element = await frame.$(selector);
+        if (element) return { frame, selector };
+      } catch (error) {
+        // Continue
+      }
+    }
+  }
+  
+  return null;
+}
+
+async function handleRedirects() {
+  console.log('Checking for redirects...');
+  
+  // Wait a bit to see if we get redirected
+  await page.waitForTimeout(2000);
+  
+  const currentUrl = page.url();
+  console.log(`Current URL after potential redirect: ${currentUrl}`);
+  
+  // Handle common redirect patterns
+  if (currentUrl.includes('/auth') && !currentUrl.includes('/login')) {
+    console.log('Detected redirect to auth page, looking for login options...');
+    
+    // Try to find login links or buttons
+    const loginSelectors = [
+      'a[href*="login"]',
+      'a[href*="signin"]',
+      '.login-btn',
+      '.signin-btn'
+    ];
+    
+    // Also try to find buttons by text content using evaluate
+    const loginButtonFound = await page.evaluate(() => {
+      const buttons = document.querySelectorAll('button, .btn, a');
+      for (const btn of buttons) {
+        const text = btn.textContent.toLowerCase();
+        if (text.includes('log in') || text.includes('sign in') || text.includes('login')) {
+          btn.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    
+    if (loginButtonFound) {
+      await page.waitForNavigation({ waitUntil: 'networkidle2' });
+      console.log('Clicked login button by text content');
+      return true;
+    }
+    
+    for (const selector of loginSelectors) {
+      try {
+        await page.waitForSelector(selector, { timeout: 5000 });
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'networkidle2' }),
+          page.click(selector)
+        ]);
+        console.log(`Clicked login element: ${selector}`);
+        return true;
+      } catch (error) {
+        // Continue trying other selectors
+      }
+    }
+  }
+  
+  return false;
 }
 
 async function login() {
-  console.log('Attempting to login...');
-  await page.goto(`${config.FALIX_BASE_URL}/auth/login`, { waitUntil: 'networkidle2' });
+  return pRetry(async () => {
+    console.log('Attempting to login...');
+    
+    try {
+      // Navigate to login page with better wait conditions
+      await page.goto(`${config.FALIX_BASE_URL}/auth/login`, { 
+        waitUntil: ['DOMContentLoaded', 'networkidle2'],
+        timeout: 45000 
+      });
+      
+      // Handle potential redirects
+      await handleRedirects();
+      
+      // Handle Cloudflare/Turnstile/hCaptcha before looking for login form
+      await handleEnhancedCloudflareVerification();
+      
+      // Robust selector arrays
+      const emailSelectors = [
+        'input[name="email"]',
+        'input[type="email"]',
+        '#email',
+        'input[name="username"]',
+        'input[placeholder*="email" i]',
+        'input[placeholder*="username" i]'
+      ];
+      
+      const passwordSelectors = [
+        'input[name="password"]',
+        'input[type="password"]',
+        '#password',
+        'input[placeholder*="password" i]'
+      ];
+      
+      const submitSelectors = [
+        'button[type="submit"]',
+        'input[type="submit"]',
+        '[data-testid*="login"]',
+        '.btn-primary',
+        '.login-btn',
+        '.signin-btn'
+      ];
+      
+      // Find elements in main page or frames
+      const emailElement = await findElementInFrames(emailSelectors);
+      const passwordElement = await findElementInFrames(passwordSelectors);
+      let submitElement = await findElementInFrames(submitSelectors);
+      
+      if (!emailElement) {
+        throw new Error('Email input field not found');
+      }
+      if (!passwordElement) {
+        throw new Error('Password input field not found');
+      }
+      
+      // Fallback: try to find submit button by text content
+      if (!submitElement) {
+        console.log('Submit button not found with selectors, trying text content...');
+        const submitButtonFound = await emailElement.frame.evaluate(() => {
+          const buttons = document.querySelectorAll('button, .btn, input[type="submit"], input[type="button"]');
+          for (const btn of buttons) {
+            const text = btn.textContent.toLowerCase();
+            if (text.includes('log in') || text.includes('sign in') || text.includes('login') || 
+                text.includes('submit') || text.includes('continue')) {
+              return true;
+            }
+          }
+          return false;
+        });
+        
+        if (submitButtonFound) {
+          // Use a generic selector to click the button we found
+          submitElement = { 
+            frame: emailElement.frame, 
+            selector: 'button, .btn, input[type="submit"], input[type="button"]' 
+          };
+        }
+      }
+      
+      if (!submitElement) {
+        throw new Error('Submit button not found');
+      }
+      
+      console.log(`Found email field with selector: ${emailElement.selector}`);
+      console.log(`Found password field with selector: ${passwordElement.selector}`);
+      console.log(`Found submit button with selector: ${submitElement.selector}`);
+      
+      // Fill in the form
+      await emailElement.frame.type(emailElement.selector, config.FALIX_EMAIL);
+      await passwordElement.frame.type(passwordElement.selector, config.FALIX_PASSWORD);
+      
+      // Submit the form
+      await Promise.all([
+        emailElement.frame.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 }),
+        emailElement.frame.click(submitElement.selector)
+      ]);
+      
+      // Handle any post-login verification
+      await handleEnhancedCloudflareVerification();
+      
+      console.log('Login successful');
+      
+    } catch (error) {
+      console.error(`Login attempt failed: ${error.message}`);
+      await captureDiagnosticInfo('login-failure');
+      throw error;
+    }
+  }, {
+    retries: 3,
+    factor: 2,
+    minTimeout: 2000,
+    onFailedAttempt: async (error) => {
+      console.log(`Login attempt ${error.attemptNumber} failed. ${error.retriesLeft} retries left.`);
+      if (error.attemptNumber > 1) {
+        await page.reload();
+      }
+    }
+  });
+}
+
+async function handleEnhancedCloudflareVerification() {
+  console.log('Checking for Cloudflare/Turnstile/hCaptcha verification...');
   
-  await page.waitForSelector('input[name="email"], input[type="email"]', { timeout: 10000 });
-  await page.type('input[name="email"], input[type="email"]', config.FALIX_EMAIL);
-  await page.type('input[name="password"], input[type="password"]', config.FALIX_PASSWORD);
+  const maxWaitTime = 90000; // 90 seconds
+  const startTime = Date.now();
   
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: 'networkidle2' }),
-    page.click('button[type="submit"], input[type="submit"], .btn-primary')
-  ]);
+  while (Date.now() - startTime < maxWaitTime) {
+    try {
+      // Check for various verification indicators
+      const verificationSelectors = [
+        // Cloudflare
+        '.cf-browser-verification',
+        '#cf-challenge-running',
+        '[data-ray]',
+        '.cf-im-under-attack',
+        // Turnstile
+        'iframe[title*="turnstile" i]',
+        'iframe[src*="turnstile"]',
+        '.cf-turnstile',
+        // hCaptcha
+        'iframe[title*="hcaptcha" i]',
+        'iframe[src*="hcaptcha"]',
+        '.h-captcha',
+        // Generic challenge indicators
+        '.challenge-form',
+        '[id*="challenge"]',
+        '[class*="challenge"]'
+      ];
+      
+      let verificationDetected = false;
+      
+      for (const selector of verificationSelectors) {
+        const element = await page.$(selector);
+        if (element) {
+          console.log(`Verification detected with selector: ${selector}`);
+          verificationDetected = true;
+          break;
+        }
+      }
+      
+      // Check iframes for verification challenges
+      const frames = page.frames();
+      for (const frame of frames) {
+        const frameUrl = frame.url();
+        if (frameUrl.includes('turnstile') || frameUrl.includes('hcaptcha') || 
+            frameUrl.includes('challenge') || frameUrl.includes('cf-')) {
+          console.log(`Verification detected in iframe: ${frameUrl}`);
+          verificationDetected = true;
+          break;
+        }
+      }
+      
+      if (!verificationDetected) {
+        console.log('No verification detected, proceeding...');
+        return;
+      }
+      
+      // Try to interact with verification elements
+      const interacted = await page.evaluate(() => {
+        // Try to find and click verify buttons or checkboxes
+        const interactSelectors = [
+          'input[type="checkbox"]',
+          '.cf-turnstile-wrapper',
+          '[data-sitekey]'
+        ];
+        
+        for (const selector of interactSelectors) {
+          const element = document.querySelector(selector);
+          if (element && element.offsetParent !== null) {
+            element.click();
+            return true;
+          }
+        }
+        
+        // Also try to find buttons by text content
+        const buttons = document.querySelectorAll('button, .btn, input[type="button"]');
+        for (const btn of buttons) {
+          const text = btn.textContent.toLowerCase();
+          if ((text.includes('verify') || text.includes('i\'m human') || text.includes('continue')) && 
+              btn.offsetParent !== null) {
+            btn.click();
+            return true;
+          }
+        }
+        
+        return false;
+      });
+      
+      if (interacted) {
+        console.log('Attempted to interact with verification element');
+      }
+      
+      // Wait a bit before checking again
+      await page.waitForTimeout(3000);
+      
+    } catch (error) {
+      console.log(`Error during verification check: ${error.message}`);
+      await page.waitForTimeout(2000);
+    }
+  }
   
-  await handleCloudflareVerification();
-  console.log('Login successful');
+  console.log('Verification wait timeout reached, proceeding anyway...');
 }
 
 async function handleCloudflareVerification() {
-  console.log('Checking for Cloudflare verification...');
-  try {
-    const cfVerification = await page.$('.cf-browser-verification, #cf-challenge-running, [data-ray]');
-    if (cfVerification) {
-      console.log('Cloudflare verification detected, waiting...');
-      await page.waitForFunction(
-        () => !document.querySelector('.cf-browser-verification, #cf-challenge-running, [data-ray]'),
-        { timeout: 60000 }
-      );
-      console.log('Cloudflare verification completed');
-    }
-  } catch (error) {
-    console.log('No Cloudflare verification or timeout reached, continuing...');
-  }
+  // Keep the original function for backward compatibility
+  return handleEnhancedCloudflareVerification();
 }
 
 async function checkServerStatus() {
   console.log(`Checking server status for ${config.FALIX_SERVER_HOST}...`);
-  await page.goto(`${config.FALIX_BASE_URL}/`, { waitUntil: 'networkidle2' });
-  
-  await handleCloudflareVerification();
-  
   try {
+    await page.goto(`${config.FALIX_BASE_URL}/`, { 
+      waitUntil: ['DOMContentLoaded', 'networkidle2'],
+      timeout: 45000 
+    });
+    
+    await handleEnhancedCloudflareVerification();
+    
     await page.waitForTimeout(3000);
     
     const serverStatus = await page.evaluate((serverHost) => {
@@ -132,17 +462,21 @@ async function checkServerStatus() {
     return serverStatus.isOffline;
   } catch (error) {
     console.error('Error checking server status:', error.message);
+    await captureDiagnosticInfo('server-status-error');
     return false;
   }
 }
 
 async function startServer() {
   console.log('Server is offline, attempting to start...');
-  await page.goto(`${config.FALIX_BASE_URL}/server/console`, { waitUntil: 'networkidle2' });
-  
-  await handleCloudflareVerification();
-  
   try {
+    await page.goto(`${config.FALIX_BASE_URL}/server/console`, { 
+      waitUntil: ['DOMContentLoaded', 'networkidle2'],
+      timeout: 45000 
+    });
+    
+    await handleEnhancedCloudflareVerification();
+    
     await page.waitForTimeout(2000);
     
     const startButton = await page.evaluate(() => {
@@ -176,6 +510,7 @@ async function startServer() {
     }
   } catch (error) {
     console.error('Error starting server:', error.message);
+    await captureDiagnosticInfo('start-server-error');
   }
 }
 

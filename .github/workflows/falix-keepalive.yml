@@ -37,3 +37,19 @@ jobs:
         AD_WATCH_MS: ${{ secrets.AD_WATCH_MS || '35000' }}
         HEADLESS: ${{ secrets.HEADLESS || 'true' }}
       run: npm run keepalive
+    
+    - name: Upload diagnostic artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: falix-diagnostics-${{ github.run_number }}
+        path: /tmp/falix-*.png
+        retention-days: 7
+    
+    - name: Upload HTML diagnostics
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: falix-html-${{ github.run_number }}
+        path: /tmp/falix-*.html
+        retention-days: 7
