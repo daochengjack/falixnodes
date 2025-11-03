@@ -11,7 +11,7 @@ This document outlines the improvements made to fix Puppeteer login timeout issu
 - **Timeouts**: Increased to 45 seconds for both default and navigation timeouts
 
 ### 2. Robust Login Flow
-- **Navigation**: Uses both `DOMContentLoaded` and `networkidle2` wait conditions
+- **Navigation**: Uses both `domcontentloaded` and `networkidle0` wait conditions
 - **Redirect Handling**: Automatically detects and follows redirects to `/auth`, `/auth/signin`, or OAuth providers
 - **Retry Mechanism**: Wrapped entire login process with internal `withRetry` helper (3 attempts)
 - **Error Recovery**: Page reload on retry attempts
