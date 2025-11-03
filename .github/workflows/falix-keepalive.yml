@@ -1,6 +1,8 @@
 name: Falix Keepalive Bot
 
 on:
+  push:
+    branches: [main]
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
@@ -24,6 +26,9 @@ jobs:
         node-version: ${{ matrix.node-version }}
         cache: 'npm'
     
+    - name: Run navigation waitUntil guard
+      run: node scripts/ci-guard.js
+    
     - name: Install dependencies
       run: npm ci
     
@@ -39,17 +44,19 @@ jobs:
       run: npm run keepalive
     
     - name: Upload diagnostic artifacts
-      if: always()
+      if: failure()
       uses: actions/upload-artifact@v4
       with:
         name: falix-diagnostics-${{ github.run_number }}
         path: /tmp/falix-*.png
         retention-days: 7
+        if-no-files-found: ignore
     
     - name: Upload HTML diagnostics
-      if: always()
+      if: failure()
       uses: actions/upload-artifact@v4
       with:
         name: falix-html-${{ github.run_number }}
         path: /tmp/falix-*.html
         retention-days: 7
+        if-no-files-found: ignore

@@ -2,6 +2,11 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs');
 
+const NAVIGATION_WAIT_UNTIL = ['domcontentloaded', 'networkidle0'];
+const DEFAULT_NAVIGATION_TIMEOUT = 45000;
+const DEFAULT_VIEWPORT = { width: 1366, height: 768 };
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
 async function withRetry(fn, options) {
   const { retries, onFailedAttempt } = options;
   for (let i = 0; i <= retries; i++) {
@@ -38,6 +43,60 @@ if (!config.FALIX_EMAIL || !config.FALIX_PASSWORD) {
 
 let browser;
 let page;
+let pageConfigured = false;
+
+async function ensurePageConfigured() {
+  if (!page) {
+    throw new Error('Page is not initialized');
+  }
+
+  if (!pageConfigured) {
+    await page.setViewport(DEFAULT_VIEWPORT);
+    await page.setUserAgent(DEFAULT_USER_AGENT);
+    pageConfigured = true;
+    return;
+  }
+
+  const viewport = page.viewport();
+  if (!viewport || viewport.width !== DEFAULT_VIEWPORT.width || viewport.height !== DEFAULT_VIEWPORT.height) {
+    await page.setViewport(DEFAULT_VIEWPORT);
+  }
+
+  const currentUserAgent = await page.evaluate(() => navigator.userAgent).catch(() => null);
+  if (currentUserAgent !== DEFAULT_USER_AGENT) {
+    await page.setUserAgent(DEFAULT_USER_AGENT);
+  }
+}
+
+async function gotoWithRetry(url, options = {}) {
+  const { retries = 2, waitUntil = NAVIGATION_WAIT_UNTIL, timeout = DEFAULT_NAVIGATION_TIMEOUT, onFailedAttempt, ...rest } = options;
+  const navigationOptions = { waitUntil, timeout, ...rest };
+
+  return withRetry(async () => {
+    await ensurePageConfigured();
+    const response = await page.goto(url, navigationOptions);
+
+    if (page.url() === 'about:blank') {
+      console.log(`Navigation to ${url} resulted in about:blank, attempting reload`);
+      await page.waitForTimeout(500);
+      const reloadResponse = await page.reload({ waitUntil, timeout });
+      if (page.url() === 'about:blank') {
+        throw new Error(`Navigation to ${url} remained on about:blank after reload`);
+      }
+      return reloadResponse;
+    }
+
+    return response;
+  }, {
+    retries,
+    onFailedAttempt: async (attemptInfo) => {
+      console.log(`Navigation to ${url} failed on attempt ${attemptInfo.attemptNumber}: ${attemptInfo.message}`);
+      if (onFailedAttempt) {
+        await onFailedAttempt(attemptInfo);
+      }
+    }
+  });
+}
 
 async function initializeBrowser() {
   console.log('Initializing browser...');
@@ -56,13 +115,10 @@ async function initializeBrowser() {
   });
   
   page = await browser.newPage();
-  await page.setViewport({ width: 1366, height: 768 });
-  
-  // Set realistic user agent
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-  
-  page.setDefaultTimeout(45000);
-  page.setDefaultNavigationTimeout(45000);
+  pageConfigured = false;
+  await ensurePageConfigured();
+  page.setDefaultTimeout(DEFAULT_NAVIGATION_TIMEOUT);
+  page.setDefaultNavigationTimeout(DEFAULT_NAVIGATION_TIMEOUT);
 }
 
 async function captureDiagnosticInfo(context) {
@@ -170,7 +226,7 @@ async function handleRedirects() {
     });
     
     if (loginButtonFound) {
-      await page.waitForNavigation({ waitUntil: 'networkidle2' });
+      await page.waitForNavigation({ waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT });
       console.log('Clicked login button by text content');
       return true;
     }
@@ -179,7 +235,7 @@ async function handleRedirects() {
       try {
         await page.waitForSelector(selector, { timeout: 5000 });
         await Promise.all([
-          page.waitForNavigation({ waitUntil: 'networkidle2' }),
+          page.waitForNavigation({ waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT }),
           page.click(selector)
         ]);
         console.log(`Clicked login element: ${selector}`);
@@ -199,10 +255,7 @@ async function login() {
     
     try {
       // Navigate to login page with better wait conditions
-      await page.goto(`${config.FALIX_BASE_URL}/auth/login`, { 
-        waitUntil: ['DOMContentLoaded', 'networkidle2'],
-        timeout: 45000 
-      });
+      await gotoWithRetry(`${config.FALIX_BASE_URL}/auth/login`);
       
       // Handle potential redirects
       await handleRedirects();
@@ -286,7 +339,7 @@ async function login() {
       
       // Submit the form
       await Promise.all([
-        emailElement.frame.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 }),
+        emailElement.frame.waitForNavigation({ waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT }),
         emailElement.frame.click(submitElement.selector)
       ]);
       
@@ -305,7 +358,7 @@ async function login() {
     onFailedAttempt: async (error) => {
       console.log(`Login attempt ${error.attemptNumber} failed. ${error.retriesLeft} retries left.`);
       if (error.attemptNumber > 1) {
-        await page.reload();
+        await page.reload({ waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT });
       }
     }
   });
@@ -423,10 +476,7 @@ async function handleCloudflareVerification() {
 async function checkServerStatus() {
   console.log(`Checking server status for ${config.FALIX_SERVER_HOST}...`);
   try {
-    await page.goto(`${config.FALIX_BASE_URL}/`, { 
-      waitUntil: ['DOMContentLoaded', 'networkidle2'],
-      timeout: 45000 
-    });
+    await gotoWithRetry(`${config.FALIX_BASE_URL}/`);
     
     await handleEnhancedCloudflareVerification();
     
@@ -484,10 +534,7 @@ async function checkServerStatus() {
 async function startServer() {
   console.log('Server is offline, attempting to start...');
   try {
-    await page.goto(`${config.FALIX_BASE_URL}/server/console`, { 
-      waitUntil: ['DOMContentLoaded', 'networkidle2'],
-      timeout: 45000 
-    });
+    await gotoWithRetry(`${config.FALIX_BASE_URL}/server/console`);
     
     await handleEnhancedCloudflareVerification();
     
