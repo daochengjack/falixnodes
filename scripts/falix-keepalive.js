@@ -2,10 +2,51 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs');
 
-const NAVIGATION_WAIT_UNTIL = ['domcontentloaded', 'networkidle0'];
-const DEFAULT_NAVIGATION_TIMEOUT = 45000;
+const NAVIGATION_WAIT_UNTIL = 'domcontentloaded';
+const DEFAULT_NAVIGATION_TIMEOUT = 90000;
+const DEFAULT_TIMEOUT = 60000;
+const LOGIN_FORM_TIMEOUT = 45000;
 const DEFAULT_VIEWPORT = { width: 1366, height: 768 };
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const EMAIL_SELECTOR_CANDIDATES = [
+  'input[type="email"]',
+  'input[name="email"]',
+  'input[name="username"]',
+  '#email',
+  'input[placeholder*="email" i]',
+  'input[placeholder*="username" i]'
+];
+const PASSWORD_SELECTOR_CANDIDATES = [
+  'input[name="password"]',
+  'input[type="password"]',
+  '#password',
+  'input[placeholder*="password" i]'
+];
+const SUBMIT_SELECTOR_CANDIDATES = [
+  'button[type="submit"]',
+  'input[type="submit"]',
+  '[data-testid*="login"]',
+  '.btn-primary',
+  '.login-btn',
+  '.signin-btn'
+];
+const LOGIN_EMAIL_SELECTOR = EMAIL_SELECTOR_CANDIDATES.join(', ');
+const LOGIN_PASSWORD_SELECTOR = PASSWORD_SELECTOR_CANDIDATES.join(', ');
+const BLOCKED_DOMAIN_PATTERNS = [
+  /snigelweb\.com/i,
+  /prebid/i,
+  /onetag/i,
+  /rubiconproject\.com/i,
+  /adnxs\.com/i,
+  /pubmatic\.com/i,
+  /lijit\.com/i,
+  /triplelift\.com/i,
+  /doubleclick\.net/i,
+  /googlesyndication\.com/i,
+  /googletagmanager\.com/i,
+  /googletagservices\.com/i,
+  /google-analytics\.com/i
+];
 
 class CloudflareChallengeError extends Error {
   constructor(message) {
@@ -61,6 +102,7 @@ if (!config.FALIX_EMAIL || !config.FALIX_PASSWORD) {
 let browser;
 let page;
 let pageConfigured = false;
+let requestInterceptionConfigured = false;
 
 async function ensurePageConfigured() {
   if (!page) {
@@ -85,12 +127,141 @@ async function ensurePageConfigured() {
   }
 }
 
+function buildAllowedHosts() {
+  const hosts = new Set(['static.falixnodes.net']);
+  const addHost = (value) => {
+    if (!value) {
+      return;
+    }
+    try {
+      const url = new URL(value);
+      if (url.hostname) {
+        hosts.add(url.hostname);
+      }
+    } catch {
+      hosts.add(value);
+    }
+  };
+
+  addHost(config.FALIX_BASE_URL);
+  addHost(config.FALIX_CONSOLE_URL);
+  return hosts;
+}
+
+function shouldBlockRequest(hostname, url, allowedHosts) {
+  if (!hostname) {
+    return false;
+  }
+
+  if (allowedHosts.has(hostname)) {
+    return false;
+  }
+
+  if (hostname.endsWith('.falixnodes.net')) {
+    return false;
+  }
+
+  if (/^data:/i.test(url) || /^blob:/i.test(url)) {
+    return false;
+  }
+
+  if (BLOCKED_DOMAIN_PATTERNS.some(pattern => pattern.test(hostname) || pattern.test(url))) {
+    return true;
+  }
+
+  return false;
+}
+
+async function setupRequestInterception() {
+  if (!page || requestInterceptionConfigured) {
+    return;
+  }
+
+  const allowedHosts = buildAllowedHosts();
+
+  try {
+    await page.setRequestInterception(true);
+  } catch (error) {
+    console.error('Failed to enable request interception:', error.message);
+    return;
+  }
+
+  page.on('request', (request) => {
+    const url = request.url();
+    let hostname = null;
+
+    try {
+      hostname = new URL(url).hostname;
+    } catch {
+      hostname = null;
+    }
+
+    if (shouldBlockRequest(hostname, url, allowedHosts)) {
+      request.abort().catch(() => {});
+      return;
+    }
+
+    request.continue().catch(() => {});
+  });
+
+  requestInterceptionConfigured = true;
+}
+
+async function waitForLoginFormReady(timeout = LOGIN_FORM_TIMEOUT) {
+  if (!page) {
+    throw new Error('Page is not initialized');
+  }
+
+  console.log('Waiting for login form selectors...');
+  const deadline = Date.now() + timeout;
+
+  while (Date.now() < deadline) {
+    const emailElement = await findElementInFrames(EMAIL_SELECTOR_CANDIDATES);
+    const passwordElement = await findElementInFrames(PASSWORD_SELECTOR_CANDIDATES);
+
+    if (emailElement && passwordElement) {
+      console.log('Login form selectors detected.');
+      return;
+    }
+
+    const remaining = Math.max(250, Math.min(750, deadline - Date.now()));
+    await page.waitForTimeout(remaining);
+  }
+
+  throw new Error(`Login form selectors not detected within ${timeout}ms`);
+}
+
+async function waitForLoginFormDismissed(timeout = DEFAULT_NAVIGATION_TIMEOUT) {
+  if (!page) {
+    throw new Error('Page is not initialized');
+  }
+
+  console.log('Waiting for login form to disappear...');
+  const deadline = Date.now() + timeout;
+
+  while (Date.now() < deadline) {
+    const emailElement = await findElementInFrames(EMAIL_SELECTOR_CANDIDATES);
+    const passwordElement = await findElementInFrames(PASSWORD_SELECTOR_CANDIDATES);
+
+    if (!emailElement && !passwordElement) {
+      console.log('Login form no longer visible.');
+      return;
+    }
+
+    const remaining = Math.max(250, Math.min(750, deadline - Date.now()));
+    await page.waitForTimeout(remaining);
+  }
+
+  throw new Error(`Login form still visible after ${timeout}ms`);
+}
+
 async function gotoWithRetry(url, options = {}) {
   const { retries = 2, waitUntil = NAVIGATION_WAIT_UNTIL, timeout = DEFAULT_NAVIGATION_TIMEOUT, onFailedAttempt, ...rest } = options;
   const navigationOptions = { waitUntil, timeout, ...rest };
 
   return withRetry(async () => {
     await ensurePageConfigured();
+    await setupRequestInterception();
     const response = await page.goto(url, navigationOptions);
 
     if (page.url() === 'about:blank') {
@@ -133,9 +304,16 @@ async function initializeBrowser() {
   
   page = await browser.newPage();
   pageConfigured = false;
+  requestInterceptionConfigured = false;
   await ensurePageConfigured();
-  page.setDefaultTimeout(DEFAULT_NAVIGATION_TIMEOUT);
+  try {
+    await page.setBypassCSP(true);
+  } catch (error) {
+    console.warn(`Unable to set bypass CSP: ${error.message}`);
+  }
+  page.setDefaultTimeout(DEFAULT_TIMEOUT);
   page.setDefaultNavigationTimeout(DEFAULT_NAVIGATION_TIMEOUT);
+  await setupRequestInterception();
 }
 
 async function captureDiagnosticInfo(context) {
@@ -243,7 +421,8 @@ async function handleRedirects() {
     });
     
     if (loginButtonFound) {
-      await page.waitForNavigation({ waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT });
+      await page.waitForTimeout(500);
+      await waitForLoginFormReady();
       console.log('Clicked login button by text content');
       return true;
     }
@@ -251,14 +430,13 @@ async function handleRedirects() {
     for (const selector of loginSelectors) {
       try {
         await page.waitForSelector(selector, { timeout: 5000 });
-        await Promise.all([
-          page.waitForNavigation({ waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT }),
-          page.click(selector)
-        ]);
+        await page.click(selector);
+        await page.waitForTimeout(300);
+        await waitForLoginFormReady();
         console.log(`Clicked login element: ${selector}`);
         return true;
       } catch (error) {
-        // Continue trying other selectors
+        console.log(`Redirect handler attempt for ${selector} failed: ${error.message}`);
       }
     }
   }
@@ -267,44 +445,40 @@ async function handleRedirects() {
 }
 
 async function login() {
+  const loginUrl = `${config.FALIX_BASE_URL}/auth/login`;
+
   return withRetry(async () => {
     console.log('Attempting to login...');
     
     try {
-      await gotoWithRetry(`${config.FALIX_BASE_URL}/auth/login`);
+      await gotoWithRetry(loginUrl, { waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT });
       await ensureNoCloudflareChallenge('login navigation');
-      
-      await handleRedirects();
+
+      try {
+        await page.waitForSelector(LOGIN_EMAIL_SELECTOR, { timeout: LOGIN_FORM_TIMEOUT });
+      } catch (selectorError) {
+        console.log(`Primary login selector wait did not resolve: ${selectorError.message}`);
+      }
+
+      let loginFormReady = false;
+      try {
+        await waitForLoginFormReady();
+        loginFormReady = true;
+      } catch (readinessError) {
+        console.log(`Login form not ready immediately: ${readinessError.message}`);
+      }
+
+      const redirectHandled = await handleRedirects();
+
+      if (!loginFormReady || redirectHandled) {
+        await waitForLoginFormReady();
+      }
+
       await ensureNoCloudflareChallenge('post-redirect');
-      
-      const emailSelectors = [
-        'input[name="email"]',
-        'input[type="email"]',
-        '#email',
-        'input[name="username"]',
-        'input[placeholder*="email" i]',
-        'input[placeholder*="username" i]'
-      ];
-      
-      const passwordSelectors = [
-        'input[name="password"]',
-        'input[type="password"]',
-        '#password',
-        'input[placeholder*="password" i]'
-      ];
-      
-      const submitSelectors = [
-        'button[type="submit"]',
-        'input[type="submit"]',
-        '[data-testid*="login"]',
-        '.btn-primary',
-        '.login-btn',
-        '.signin-btn'
-      ];
-      
-      const emailElement = await findElementInFrames(emailSelectors);
-      const passwordElement = await findElementInFrames(passwordSelectors);
-      let submitElement = await findElementInFrames(submitSelectors);
+
+      const emailElement = await findElementInFrames(EMAIL_SELECTOR_CANDIDATES);
+      const passwordElement = await findElementInFrames(PASSWORD_SELECTOR_CANDIDATES);
+      let submitElement = await findElementInFrames(SUBMIT_SELECTOR_CANDIDATES);
       
       if (!emailElement) {
         throw new Error('Email input field not found');
@@ -318,7 +492,7 @@ async function login() {
         const submitButtonFound = await emailElement.frame.evaluate(() => {
           const buttons = document.querySelectorAll('button, .btn, input[type="submit"], input[type="button"]');
           for (const btn of buttons) {
-            const text = btn.textContent.toLowerCase();
+            const text = (btn.innerText || btn.textContent || btn.value || '').toLowerCase();
             if (text.includes('log in') || text.includes('sign in') || text.includes('login') || 
                 text.includes('submit') || text.includes('continue')) {
               return true;
@@ -328,9 +502,9 @@ async function login() {
         });
         
         if (submitButtonFound) {
-          submitElement = { 
-            frame: emailElement.frame, 
-            selector: 'button, .btn, input[type="submit"], input[type="button"]' 
+          submitElement = {
+            frame: emailElement.frame,
+            selector: 'button, .btn, input[type="submit"], input[type="button"]'
           };
         }
       }
@@ -343,13 +517,18 @@ async function login() {
       console.log(`Found password field with selector: ${passwordElement.selector}`);
       console.log(`Found submit button with selector: ${submitElement.selector}`);
       
+      await emailElement.frame.focus(emailElement.selector).catch(() => {});
+      await emailElement.frame.click(emailElement.selector, { clickCount: 3 }).catch(() => {});
       await emailElement.frame.type(emailElement.selector, config.FALIX_EMAIL);
+      
+      await passwordElement.frame.focus(passwordElement.selector).catch(() => {});
       await passwordElement.frame.type(passwordElement.selector, config.FALIX_PASSWORD);
       
-      await Promise.all([
-        emailElement.frame.waitForNavigation({ waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT }),
-        emailElement.frame.click(submitElement.selector)
-      ]);
+      console.log('Submitting login form...');
+      await submitElement.frame.click(submitElement.selector);
+      await page.waitForTimeout(500);
+      await waitForLoginFormDismissed();
+      console.log(`Current URL after login submit: ${page.url()}`);
       
       await ensureNoCloudflareChallenge('post-login');
       
@@ -369,6 +548,7 @@ async function login() {
       console.log(`Login attempt ${error.attemptNumber} failed. ${error.retriesLeft} retries left.`);
       if (error.attemptNumber > 1) {
         await page.reload({ waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT });
+        await page.waitForTimeout(500);
       }
     }
   });
