@@ -35,7 +35,7 @@ const config = {
   FALIX_PASSWORD: process.env.FALIX_PASSWORD,
   FALIX_BASE_URL: normalizedBaseUrl,
   FALIX_SERVER_HOST: (process.env.FALIX_SERVER_HOST || 'mikeqd.falixsrv.me').trim(),
-  FALIX_SERVER_NAME: (process.env.FALIX_SERVER_NAME || '').trim(),
+  FALIX_SERVER_NAME: (process.env.FALIX_SERVER_NAME || 'mikeqd.falixsrv.me').trim(),
   FALIX_CONSOLE_URL: normalizedConsoleUrl,
   CHECK_INTERVAL_MS: parseInt(process.env.CHECK_INTERVAL_MS) || 120000,
   AD_WATCH_MS: parseInt(process.env.AD_WATCH_MS) || 35000,
