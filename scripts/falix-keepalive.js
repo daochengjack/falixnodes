@@ -1,6 +1,5 @@
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const pRetry = require('p-retry');
 const fs = require('fs');
 
 puppeteer.use(StealthPlugin());
@@ -12,12 +11,67 @@ const config = {
   FALIX_SERVER_HOST: process.env.FALIX_SERVER_HOST || 'mikeqd.falixsrv.me',
   CHECK_INTERVAL_MS: parseInt(process.env.CHECK_INTERVAL_MS) || 120000,
   AD_WATCH_MS: parseInt(process.env.AD_WATCH_MS) || 35000,
-  HEADLESS: process.env.HEADLESS !== 'false'
+  HEADLESS: process.env.HEADLESS !== 'false',
+  DEBUG_KEEPALIVE: process.env.DEBUG_KEEPALIVE === 'true'
 };
 
 if (!config.FALIX_EMAIL || !config.FALIX_PASSWORD) {
   console.error('FALIX_EMAIL and FALIX_PASSWORD environment variables are required');
   process.exit(1);
+}
+
+function debugLog(message) {
+  if (config.DEBUG_KEEPALIVE) {
+    console.log(`[DEBUG] ${message}`);
+  }
+}
+
+async function withRetry(fn, options = {}) {
+  const {
+    maxRetries = 3,
+    baseTimeout = 2000,
+    multiplier = 2,
+    onFailedAttempt = null
+  } = options;
+  
+  let lastError;
+  
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      debugLog(`Attempt ${attempt} of ${maxRetries + 1}`);
+      const result = await fn();
+      if (attempt > 1) {
+        debugLog(`Attempt ${attempt} succeeded`);
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      const retriesLeft = maxRetries + 1 - attempt;
+      
+      debugLog(`Attempt ${attempt} failed: ${error.message}`);
+      
+      if (onFailedAttempt) {
+        await onFailedAttempt({
+          attemptNumber: attempt,
+          retriesLeft,
+          error
+        });
+      }
+      
+      if (retriesLeft > 0) {
+        // Exponential backoff with jitter
+        const exponentialDelay = baseTimeout * Math.pow(multiplier, attempt - 1);
+        const jitter = Math.random() * 0.3 * exponentialDelay; // 30% jitter
+        const delay = exponentialDelay + jitter;
+        
+        debugLog(`Waiting ${Math.round(delay)}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        debugLog(`All ${maxRetries + 1} attempts failed`);
+        throw lastError;
+      }
+    }
+  }
 }
 
 let browser;
@@ -178,7 +232,7 @@ async function handleRedirects() {
 }
 
 async function login() {
-  return pRetry(async () => {
+  return withRetry(async () => {
     console.log('Attempting to login...');
     
     try {
@@ -285,9 +339,9 @@ async function login() {
       throw error;
     }
   }, {
-    retries: 3,
-    factor: 2,
-    minTimeout: 2000,
+    maxRetries: 3,
+    baseTimeout: 2000,
+    multiplier: 2,
     onFailedAttempt: async (error) => {
       console.log(`Login attempt ${error.attemptNumber} failed. ${error.retriesLeft} retries left.`);
       if (error.attemptNumber > 1) {
@@ -298,107 +352,117 @@ async function login() {
 }
 
 async function handleEnhancedCloudflareVerification() {
-  console.log('Checking for Cloudflare/Turnstile/hCaptcha verification...');
-  
-  const maxWaitTime = 90000; // 90 seconds
-  const startTime = Date.now();
-  
-  while (Date.now() - startTime < maxWaitTime) {
-    try {
-      // Check for various verification indicators
-      const verificationSelectors = [
-        // Cloudflare
-        '.cf-browser-verification',
-        '#cf-challenge-running',
-        '[data-ray]',
-        '.cf-im-under-attack',
-        // Turnstile
-        'iframe[title*="turnstile" i]',
-        'iframe[src*="turnstile"]',
-        '.cf-turnstile',
-        // hCaptcha
-        'iframe[title*="hcaptcha" i]',
-        'iframe[src*="hcaptcha"]',
-        '.h-captcha',
-        // Generic challenge indicators
-        '.challenge-form',
-        '[id*="challenge"]',
-        '[class*="challenge"]'
-      ];
-      
-      let verificationDetected = false;
-      
-      for (const selector of verificationSelectors) {
-        const element = await page.$(selector);
-        if (element) {
-          console.log(`Verification detected with selector: ${selector}`);
-          verificationDetected = true;
-          break;
-        }
-      }
-      
-      // Check iframes for verification challenges
-      const frames = page.frames();
-      for (const frame of frames) {
-        const frameUrl = frame.url();
-        if (frameUrl.includes('turnstile') || frameUrl.includes('hcaptcha') || 
-            frameUrl.includes('challenge') || frameUrl.includes('cf-')) {
-          console.log(`Verification detected in iframe: ${frameUrl}`);
-          verificationDetected = true;
-          break;
-        }
-      }
-      
-      if (!verificationDetected) {
-        console.log('No verification detected, proceeding...');
-        return;
-      }
-      
-      // Try to interact with verification elements
-      const interacted = await page.evaluate(() => {
-        // Try to find and click verify buttons or checkboxes
-        const interactSelectors = [
-          'input[type="checkbox"]',
-          '.cf-turnstile-wrapper',
-          '[data-sitekey]'
+  return withRetry(async () => {
+    console.log('Checking for Cloudflare/Turnstile/hCaptcha verification...');
+    
+    const maxWaitTime = 90000; // 90 seconds
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < maxWaitTime) {
+      try {
+        // Check for various verification indicators
+        const verificationSelectors = [
+          // Cloudflare
+          '.cf-browser-verification',
+          '#cf-challenge-running',
+          '[data-ray]',
+          '.cf-im-under-attack',
+          // Turnstile
+          'iframe[title*="turnstile" i]',
+          'iframe[src*="turnstile"]',
+          '.cf-turnstile',
+          // hCaptcha
+          'iframe[title*="hcaptcha" i]',
+          'iframe[src*="hcaptcha"]',
+          '.h-captcha',
+          // Generic challenge indicators
+          '.challenge-form',
+          '[id*="challenge"]',
+          '[class*="challenge"]'
         ];
         
-        for (const selector of interactSelectors) {
-          const element = document.querySelector(selector);
-          if (element && element.offsetParent !== null) {
-            element.click();
-            return true;
+        let verificationDetected = false;
+        
+        for (const selector of verificationSelectors) {
+          const element = await page.$(selector);
+          if (element) {
+            console.log(`Verification detected with selector: ${selector}`);
+            verificationDetected = true;
+            break;
           }
         }
         
-        // Also try to find buttons by text content
-        const buttons = document.querySelectorAll('button, .btn, input[type="button"]');
-        for (const btn of buttons) {
-          const text = btn.textContent.toLowerCase();
-          if ((text.includes('verify') || text.includes('i\'m human') || text.includes('continue')) && 
-              btn.offsetParent !== null) {
-            btn.click();
-            return true;
+        // Check iframes for verification challenges
+        const frames = page.frames();
+        for (const frame of frames) {
+          const frameUrl = frame.url();
+          if (frameUrl.includes('turnstile') || frameUrl.includes('hcaptcha') || 
+              frameUrl.includes('challenge') || frameUrl.includes('cf-')) {
+            console.log(`Verification detected in iframe: ${frameUrl}`);
+            verificationDetected = true;
+            break;
           }
         }
         
-        return false;
-      });
-      
-      if (interacted) {
-        console.log('Attempted to interact with verification element');
+        if (!verificationDetected) {
+          console.log('No verification detected, proceeding...');
+          return true;
+        }
+        
+        // Try to interact with verification elements
+        const interacted = await page.evaluate(() => {
+          // Try to find and click verify buttons or checkboxes
+          const interactSelectors = [
+            'input[type="checkbox"]',
+            '.cf-turnstile-wrapper',
+            '[data-sitekey]'
+          ];
+          
+          for (const selector of interactSelectors) {
+            const element = document.querySelector(selector);
+            if (element && element.offsetParent !== null) {
+              element.click();
+              return true;
+            }
+          }
+          
+          // Also try to find buttons by text content
+          const buttons = document.querySelectorAll('button, .btn, input[type="button"]');
+          for (const btn of buttons) {
+            const text = btn.textContent.toLowerCase();
+            if ((text.includes('verify') || text.includes('i\'m human') || text.includes('continue')) && 
+                btn.offsetParent !== null) {
+              btn.click();
+              return true;
+            }
+          }
+          
+          return false;
+        });
+        
+        if (interacted) {
+          console.log('Attempted to interact with verification element');
+        }
+        
+        // Wait a bit before checking again
+        await page.waitForTimeout(3000);
+        
+      } catch (error) {
+        console.log(`Error during verification check: ${error.message}`);
+        await page.waitForTimeout(2000);
       }
-      
-      // Wait a bit before checking again
-      await page.waitForTimeout(3000);
-      
-    } catch (error) {
-      console.log(`Error during verification check: ${error.message}`);
-      await page.waitForTimeout(2000);
     }
-  }
-  
-  console.log('Verification wait timeout reached, proceeding anyway...');
+    
+    console.log('Verification wait timeout reached, proceeding anyway...');
+    return true;
+  }, {
+    maxRetries: 2,
+    baseTimeout: 1000,
+    multiplier: 1.5,
+    onFailedAttempt: async (error) => {
+      debugLog(`Cloudflare verification attempt ${error.attemptNumber} failed: ${error.error.message}`);
+    }
+  });
 }
 
 async function handleCloudflareVerification() {
@@ -407,8 +471,9 @@ async function handleCloudflareVerification() {
 }
 
 async function checkServerStatus() {
-  console.log(`Checking server status for ${config.FALIX_SERVER_HOST}...`);
-  try {
+  return withRetry(async () => {
+    console.log(`Checking server status for ${config.FALIX_SERVER_HOST}...`);
+    
     await page.goto(`${config.FALIX_BASE_URL}/`, { 
       waitUntil: ['DOMContentLoaded', 'networkidle2'],
       timeout: 45000 
@@ -460,16 +525,21 @@ async function checkServerStatus() {
     
     console.log(`Server status: ${serverStatus.statusText}`);
     return serverStatus.isOffline;
-  } catch (error) {
-    console.error('Error checking server status:', error.message);
-    await captureDiagnosticInfo('server-status-error');
-    return false;
-  }
+  }, {
+    maxRetries: 2,
+    baseTimeout: 1000,
+    multiplier: 1.5,
+    onFailedAttempt: async (error) => {
+      console.log(`Server status check attempt ${error.attemptNumber} failed. ${error.retriesLeft} retries left.`);
+      await captureDiagnosticInfo('server-status-error');
+    }
+  });
 }
 
 async function startServer() {
-  console.log('Server is offline, attempting to start...');
-  try {
+  return withRetry(async () => {
+    console.log('Server is offline, attempting to start...');
+    
     await page.goto(`${config.FALIX_BASE_URL}/server/console`, { 
       waitUntil: ['DOMContentLoaded', 'networkidle2'],
       timeout: 45000 
@@ -505,13 +575,20 @@ async function startServer() {
     const isStarted = await checkServerStarted();
     if (isStarted) {
       console.log('Server started successfully');
+      return true;
     } else {
       console.log('Server start initiated, but status not yet updated');
+      return true; // Still consider success since button was clicked
     }
-  } catch (error) {
-    console.error('Error starting server:', error.message);
-    await captureDiagnosticInfo('start-server-error');
-  }
+  }, {
+    maxRetries: 2,
+    baseTimeout: 1500,
+    multiplier: 2,
+    onFailedAttempt: async (error) => {
+      console.log(`Start server attempt ${error.attemptNumber} failed. ${error.retriesLeft} retries left.`);
+      await captureDiagnosticInfo('start-server-error');
+    }
+  });
 }
 
 async function handleAdModal() {

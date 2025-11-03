@@ -9,8 +9,7 @@
   "dependencies": {
     "puppeteer": "^21.5.0",
     "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "p-retry": "^5.1.2"
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
   "keywords": ["falix", "keepalive", "bot", "automation"],
   "author": "",
