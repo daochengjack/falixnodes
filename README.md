@@ -9,7 +9,7 @@ An automated bot that monitors and keeps your Falix server online by automatical
 - Automatically starts the server when it detects it's offline
 - Handles ad modal workflows (waits 35 seconds for ads)
 - Robust error handling with retry logic
-- Cloudflare verification handling
+- Gracefully skips runs when Cloudflare challenges appear
 - GitHub Actions workflow for scheduled runs
 
 ## Setup
@@ -78,7 +78,7 @@ The workflow is configured to:
 ## How It Works
 
 1. **Login**: The bot logs into your Falix account using the provided credentials
-2. **Cloudflare Handling**: If Cloudflare verification appears, it waits for it to complete
+2. **Cloudflare Detection**: If a Cloudflare challenge appears, the run is skipped so the scheduler can retry later
 3. **Server Detection** (two strategies):
    - **Direct Console**: If `FALIX_CONSOLE_URL` is explicitly provided, navigates directly to console and validates by checking for Start/Stop controls and matching server name/host
    - **Dashboard Fallback**: If direct console fails or not configured, navigates to dashboard, scrolls to load all servers, collects server cards/rows, and matches by exact host (`FALIX_SERVER_HOST`) or display name (`FALIX_SERVER_NAME`, case-insensitive)
@@ -101,7 +101,7 @@ When a server is not found, the bot logs all detected servers with their hosts, 
 
 1. **Login Failures**: Verify your credentials are correct and that your account is in good standing
 2. **Server Not Found**: Ensure the `FALIX_SERVER_HOST` matches exactly what appears in your dashboard
-3. **Cloudflare Issues**: The bot includes retry logic for Cloudflare verification
+3. **Cloudflare Challenges**: The bot does not attempt to solve Cloudflare challenges. When detected, it exits gracefully and the scheduled job will retry later when the challenge may be absent
 4. **Timeout Issues**: Adjust timeout values if you have a slow connection
 
 ### Debug Mode
