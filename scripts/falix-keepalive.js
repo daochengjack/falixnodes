@@ -7,12 +7,23 @@ const DEFAULT_NAVIGATION_TIMEOUT = 45000;
 const DEFAULT_VIEWPORT = { width: 1366, height: 768 };
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+class CloudflareChallengeError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'CloudflareChallengeError';
+  }
+}
+
 async function withRetry(fn, options) {
   const { retries, onFailedAttempt } = options;
   for (let i = 0; i <= retries; i++) {
     try {
       return await fn();
     } catch (error) {
+      if (error instanceof CloudflareChallengeError) {
+        throw error;
+      }
+
       if (i < retries) {
         if (onFailedAttempt) {
           await onFailedAttempt({ attemptNumber: i + 1, retriesLeft: retries - i, message: error.message });
@@ -260,16 +271,12 @@ async function login() {
     console.log('Attempting to login...');
     
     try {
-      // Navigate to login page with better wait conditions
       await gotoWithRetry(`${config.FALIX_BASE_URL}/auth/login`);
+      await ensureNoCloudflareChallenge('login navigation');
       
-      // Handle potential redirects
       await handleRedirects();
+      await ensureNoCloudflareChallenge('post-redirect');
       
-      // Handle Cloudflare/Turnstile/hCaptcha before looking for login form
-      await handleEnhancedCloudflareVerification();
-      
-      // Robust selector arrays
       const emailSelectors = [
         'input[name="email"]',
         'input[type="email"]',
@@ -295,7 +302,6 @@ async function login() {
         '.signin-btn'
       ];
       
-      // Find elements in main page or frames
       const emailElement = await findElementInFrames(emailSelectors);
       const passwordElement = await findElementInFrames(passwordSelectors);
       let submitElement = await findElementInFrames(submitSelectors);
@@ -307,7 +313,6 @@ async function login() {
         throw new Error('Password input field not found');
       }
       
-      // Fallback: try to find submit button by text content
       if (!submitElement) {
         console.log('Submit button not found with selectors, trying text content...');
         const submitButtonFound = await emailElement.frame.evaluate(() => {
@@ -323,7 +328,6 @@ async function login() {
         });
         
         if (submitButtonFound) {
-          // Use a generic selector to click the button we found
           submitElement = { 
             frame: emailElement.frame, 
             selector: 'button, .btn, input[type="submit"], input[type="button"]' 
@@ -339,22 +343,22 @@ async function login() {
       console.log(`Found password field with selector: ${passwordElement.selector}`);
       console.log(`Found submit button with selector: ${submitElement.selector}`);
       
-      // Fill in the form
       await emailElement.frame.type(emailElement.selector, config.FALIX_EMAIL);
       await passwordElement.frame.type(passwordElement.selector, config.FALIX_PASSWORD);
       
-      // Submit the form
       await Promise.all([
         emailElement.frame.waitForNavigation({ waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT }),
         emailElement.frame.click(submitElement.selector)
       ]);
       
-      // Handle any post-login verification
-      await handleEnhancedCloudflareVerification();
+      await ensureNoCloudflareChallenge('post-login');
       
       console.log('Login successful');
       
     } catch (error) {
+      if (error instanceof CloudflareChallengeError) {
+        throw error;
+      }
       console.error(`Login attempt failed: ${error.message}`);
       await captureDiagnosticInfo('login-failure');
       throw error;
@@ -370,113 +374,62 @@ async function login() {
   });
 }
 
-async function handleEnhancedCloudflareVerification() {
-  console.log('Checking for Cloudflare/Turnstile/hCaptcha verification...');
-  
-  const maxWaitTime = 90000; // 90 seconds
-  const startTime = Date.now();
-  
-  while (Date.now() - startTime < maxWaitTime) {
+async function ensureNoCloudflareChallenge(context) {
+  if (!page) {
+    return;
+  }
+
+  const currentUrl = page.url();
+  const challengeUrlIndicators = [
+    '/cdn-cgi/challenge',
+    '/cdn-cgi/challenge-platform',
+    '/cf-challenge',
+    '/cdn-cgi/l/chk_jschl',
+    '/cdn-cgi/s/chk_jschl',
+    'challenges.cloudflare.com'
+  ];
+
+  let detectionDetail = challengeUrlIndicators.find(indicator => currentUrl.includes(indicator));
+  if (detectionDetail) {
+    detectionDetail = `URL indicator: ${detectionDetail}`;
+  } else {
     try {
-      // Check for various verification indicators
-      const verificationSelectors = [
-        // Cloudflare
+      const indicator = await page.evaluate((selectors) => {
+        for (const selector of selectors) {
+          if (document.querySelector(selector)) {
+            return selector;
+          }
+        }
+
+        const bodyText = document.body ? (document.body.innerText || document.body.textContent || '').toLowerCase() : '';
+        if (bodyText.includes('checking your browser before accessing')) {
+          return 'checking-browser-text';
+        }
+
+        return null;
+      }, [
         '.cf-browser-verification',
         '#cf-challenge-running',
-        '[data-ray]',
         '.cf-im-under-attack',
-        // Turnstile
-        'iframe[title*="turnstile" i]',
-        'iframe[src*="turnstile"]',
-        '.cf-turnstile',
-        // hCaptcha
-        'iframe[title*="hcaptcha" i]',
-        'iframe[src*="hcaptcha"]',
-        '.h-captcha',
-        // Generic challenge indicators
-        '.challenge-form',
-        '[id*="challenge"]',
-        '[class*="challenge"]'
-      ];
-      
-      let verificationDetected = false;
-      
-      for (const selector of verificationSelectors) {
-        const element = await page.$(selector);
-        if (element) {
-          console.log(`Verification detected with selector: ${selector}`);
-          verificationDetected = true;
-          break;
-        }
+        'form[action*="/cdn-cgi/challenge"]',
+        'body.cf-challenge',
+        '[data-translate="checking_browser"]'
+      ]);
+
+      if (indicator) {
+        detectionDetail = indicator === 'checking-browser-text'
+          ? 'Text indicator: checking your browser before accessing'
+          : `Selector indicator: ${indicator}`;
       }
-      
-      // Check iframes for verification challenges
-      const frames = page.frames();
-      for (const frame of frames) {
-        const frameUrl = frame.url();
-        if (frameUrl.includes('turnstile') || frameUrl.includes('hcaptcha') || 
-            frameUrl.includes('challenge') || frameUrl.includes('cf-')) {
-          console.log(`Verification detected in iframe: ${frameUrl}`);
-          verificationDetected = true;
-          break;
-        }
-      }
-      
-      if (!verificationDetected) {
-        console.log('No verification detected, proceeding...');
-        return;
-      }
-      
-      // Try to interact with verification elements
-      const interacted = await page.evaluate(() => {
-        // Try to find and click verify buttons or checkboxes
-        const interactSelectors = [
-          'input[type="checkbox"]',
-          '.cf-turnstile-wrapper',
-          '[data-sitekey]'
-        ];
-        
-        for (const selector of interactSelectors) {
-          const element = document.querySelector(selector);
-          if (element && element.offsetParent !== null) {
-            element.click();
-            return true;
-          }
-        }
-        
-        // Also try to find buttons by text content
-        const buttons = document.querySelectorAll('button, .btn, input[type="button"]');
-        for (const btn of buttons) {
-          const text = btn.textContent.toLowerCase();
-          if ((text.includes('verify') || text.includes('i\'m human') || text.includes('continue')) && 
-              btn.offsetParent !== null) {
-            btn.click();
-            return true;
-          }
-        }
-        
-        return false;
-      });
-      
-      if (interacted) {
-        console.log('Attempted to interact with verification element');
-      }
-      
-      // Wait a bit before checking again
-      await page.waitForTimeout(3000);
-      
     } catch (error) {
-      console.log(`Error during verification check: ${error.message}`);
-      await page.waitForTimeout(2000);
+      // Ignore errors when detecting challenge indicators
     }
   }
-  
-  console.log('Verification wait timeout reached, proceeding anyway...');
-}
 
-async function handleCloudflareVerification() {
-  // Keep the original function for backward compatibility
-  return handleEnhancedCloudflareVerification();
+  if (detectionDetail) {
+    await captureDiagnosticInfo('cloudflare-challenge');
+    throw new CloudflareChallengeError(`Cloudflare challenge detected during ${context}. ${detectionDetail} Skipping run so scheduler can retry later.`);
+  }
 }
 
 function normalizeWhitespace(value) {
@@ -615,7 +568,7 @@ async function attemptConsoleDetection() {
 
   try {
     await gotoWithRetry(config.FALIX_CONSOLE_URL);
-    await handleEnhancedCloudflareVerification();
+    await ensureNoCloudflareChallenge('console navigation');
     await page.waitForTimeout(2000);
 
     const consoleData = await page.evaluate(() => {
@@ -714,6 +667,9 @@ async function attemptConsoleDetection() {
       statusText: statusInfo.statusText
     };
   } catch (error) {
+    if (error instanceof CloudflareChallengeError) {
+      throw error;
+    }
     console.error(`Console detection failed: ${error.message}`);
     await captureDiagnosticInfo('console-direct-link-error');
     return { success: false, reason: error.message };
@@ -869,7 +825,7 @@ async function detectServerViaDashboard() {
   console.log('Falling back to dashboard server detection...');
 
   await gotoWithRetry(`${config.FALIX_BASE_URL}/`);
-  await handleEnhancedCloudflareVerification();
+  await ensureNoCloudflareChallenge('dashboard navigation');
   await page.waitForTimeout(2000);
   await loadAllServersOnDashboard();
 
@@ -920,6 +876,9 @@ async function checkServerStatus() {
     const dashboardResult = await detectServerViaDashboard();
     return dashboardResult.isOffline;
   } catch (error) {
+    if (error instanceof CloudflareChallengeError) {
+      throw error;
+    }
     console.error('Error checking server status:', error.message);
     await captureDiagnosticInfo('server-status-error');
     throw error;
@@ -930,7 +889,7 @@ async function startServer() {
   console.log('Server is offline, attempting to start...');
   try {
     await gotoWithRetry(config.FALIX_CONSOLE_URL);
-    await handleEnhancedCloudflareVerification();
+    await ensureNoCloudflareChallenge('start server navigation');
     await page.waitForTimeout(1500);
 
     const startClicked = await page.evaluate(() => {
@@ -1022,6 +981,9 @@ async function startServer() {
       console.log('Server started successfully');
     }
   } catch (error) {
+    if (error instanceof CloudflareChallengeError) {
+      throw error;
+    }
     console.error('Error starting server:', error.message);
     await captureDiagnosticInfo('start-server-error');
   }
@@ -1113,6 +1075,9 @@ async function performKeepaliveCheck() {
     }
     return true;
   } catch (error) {
+    if (error instanceof CloudflareChallengeError) {
+      throw error;
+    }
     console.error('Error during keepalive check:', error.message);
     return false;
   }
@@ -1154,8 +1119,14 @@ async function main() {
     await runKeepaliveLoop();
     console.log('\n=== Keepalive workflow completed successfully ===');
   } catch (error) {
+    if (error instanceof CloudflareChallengeError) {
+      console.log('\n=== Cloudflare challenge encountered ===');
+      console.log(error.message);
+      console.log('Skipping run so the scheduler can retry later.');
+      return;
+    }
     console.error('Fatal error in keepalive workflow:', error);
-    process.exit(1);
+    throw error;
   } finally {
     await cleanup();
   }
