@@ -1,7 +1,23 @@
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const pRetry = require('p-retry');
 const fs = require('fs');
+
+async function withRetry(fn, options) {
+  const { retries, onFailedAttempt } = options;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (i < retries) {
+        if (onFailedAttempt) {
+          await onFailedAttempt({ attemptNumber: i + 1, retriesLeft: retries - i, message: error.message });
+        }
+      } else {
+        throw error;
+      }
+    }
+  }
+}
 
 puppeteer.use(StealthPlugin());
 
@@ -178,7 +194,7 @@ async function handleRedirects() {
 }
 
 async function login() {
-  return pRetry(async () => {
+  return withRetry(async () => {
     console.log('Attempting to login...');
     
     try {
@@ -286,8 +302,6 @@ async function login() {
     }
   }, {
     retries: 3,
-    factor: 2,
-    minTimeout: 2000,
     onFailedAttempt: async (error) => {
       console.log(`Login attempt ${error.attemptNumber} failed. ${error.retriesLeft} retries left.`);
       if (error.attemptNumber > 1) {
