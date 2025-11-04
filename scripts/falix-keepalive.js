@@ -382,6 +382,216 @@ async function findElementInFrames(selectors) {
   return null;
 }
 
+async function scrollIntoViewAndCheck(frame, selector) {
+  try {
+    const isVisibleAndEnabled = await frame.evaluate((sel) => {
+      const element = document.querySelector(sel);
+      if (!element) return { visible: false, enabled: false };
+      
+      element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      const isVisible = style.display !== 'none' && 
+                       style.visibility !== 'hidden' && 
+                       style.opacity !== '0' &&
+                       rect.width > 0 && 
+                       rect.height > 0;
+      
+      const isEnabled = !element.disabled && !element.hasAttribute('disabled');
+      
+      return { visible: isVisible, enabled: isEnabled };
+    }, selector);
+    
+    return isVisibleAndEnabled;
+  } catch (error) {
+    console.log(`Failed to check visibility for ${selector}: ${error.message}`);
+    return { visible: false, enabled: false };
+  }
+}
+
+async function detectChallengeOrBlock() {
+  try {
+    const challengeDetected = await page.evaluate(() => {
+      const recaptchaSelectors = [
+        'iframe[src*="recaptcha"]',
+        '.g-recaptcha',
+        '[data-sitekey]'
+      ];
+      
+      const turnstileSelectors = [
+        'iframe[src*="turnstile"]',
+        '.cf-turnstile',
+        '[data-turnstile-sitekey]'
+      ];
+      
+      for (const selector of [...recaptchaSelectors, ...turnstileSelectors]) {
+        if (document.querySelector(selector)) {
+          return { detected: true, type: selector };
+        }
+      }
+      
+      return { detected: false, type: null };
+    });
+    
+    return challengeDetected;
+  } catch (error) {
+    return { detected: false, type: null };
+  }
+}
+
+async function waitForPostSubmitOutcome(timeout = 60000) {
+  console.log('Waiting for post-submit outcome...');
+  
+  const startUrl = page.url();
+  console.log(`Starting URL: ${startUrl}`);
+  
+  try {
+    const result = await Promise.race([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout }).then(() => ({ type: 'navigation' })).catch(() => null),
+      
+      page.waitForFunction(
+        (url) => {
+          const currentUrl = window.location.href;
+          return !/\/auth(\/|$)/.test(currentUrl) && currentUrl !== url;
+        },
+        { timeout },
+        startUrl
+      ).then(() => ({ type: 'url-change' })).catch(() => null),
+      
+      page.waitForSelector('[role="alert"], .error, .toast, [data-testid*="error"], .alert-danger, .notification-error', { timeout })
+        .then(() => ({ type: 'error' }))
+        .catch(() => null)
+    ]);
+    
+    if (!result) {
+      console.log('Post-submit wait timed out without clear outcome');
+      return { success: false, reason: 'timeout' };
+    }
+    
+    const finalUrl = page.url();
+    console.log(`Post-submit outcome: ${result.type}, final URL: ${finalUrl}`);
+    
+    if (result.type === 'error') {
+      const errorText = await page.evaluate(() => {
+        const errorEl = document.querySelector('[role="alert"], .error, .toast, [data-testid*="error"], .alert-danger, .notification-error');
+        return errorEl ? errorEl.textContent.trim() : 'Unknown error';
+      }).catch(() => 'Unknown error');
+      
+      console.log(`Error message detected: ${errorText}`);
+      return { success: false, reason: 'error-message', details: errorText };
+    }
+    
+    if (!/\/auth(\/|$)/.test(finalUrl)) {
+      console.log('Successfully left auth page');
+      return { success: true, reason: result.type };
+    }
+    
+    console.log('Still on auth page after navigation');
+    return { success: false, reason: 'still-on-auth' };
+    
+  } catch (error) {
+    console.log(`Post-submit wait error: ${error.message}`);
+    return { success: false, reason: 'exception', details: error.message };
+  }
+}
+
+async function submitLoginForm(emailElement, passwordElement, submitElement) {
+  console.log('Preparing to submit login form...');
+  
+  await captureDiagnosticInfo('pre-submit');
+  
+  console.log('Scrolling email field into view...');
+  const emailCheck = await scrollIntoViewAndCheck(emailElement.frame, emailElement.selector);
+  if (!emailCheck.visible || !emailCheck.enabled) {
+    console.warn(`Email field visibility: ${emailCheck.visible}, enabled: ${emailCheck.enabled}`);
+  }
+  await emailElement.frame.waitForTimeout(300);
+  
+  console.log('Scrolling password field into view...');
+  const passwordCheck = await scrollIntoViewAndCheck(passwordElement.frame, passwordElement.selector);
+  if (!passwordCheck.visible || !passwordCheck.enabled) {
+    console.warn(`Password field visibility: ${passwordCheck.visible}, enabled: ${passwordCheck.enabled}`);
+  }
+  await passwordElement.frame.waitForTimeout(300);
+  
+  if (submitElement) {
+    console.log('Scrolling submit button into view...');
+    const submitCheck = await scrollIntoViewAndCheck(submitElement.frame, submitElement.selector);
+    if (!submitCheck.visible || !submitCheck.enabled) {
+      console.warn(`Submit button visibility: ${submitCheck.visible}, enabled: ${submitCheck.enabled}`);
+    }
+    await submitElement.frame.waitForTimeout(300);
+  }
+  
+  console.log('Typing credentials with delays...');
+  await emailElement.frame.focus(emailElement.selector).catch(() => {});
+  await emailElement.frame.click(emailElement.selector, { clickCount: 3 }).catch(() => {});
+  await emailElement.frame.waitForTimeout(100);
+  await emailElement.frame.type(emailElement.selector, config.FALIX_EMAIL, { delay: 50 });
+  await emailElement.frame.waitForTimeout(200);
+  
+  await passwordElement.frame.focus(passwordElement.selector).catch(() => {});
+  await passwordElement.frame.waitForTimeout(100);
+  await passwordElement.frame.type(passwordElement.selector, config.FALIX_PASSWORD, { delay: 50 });
+  await passwordElement.frame.waitForTimeout(300);
+  
+  const challenge = await detectChallengeOrBlock();
+  if (challenge.detected) {
+    console.log(`Challenge or block detected: ${challenge.type}`);
+    await captureDiagnosticInfo('challenge-detected');
+    throw new CloudflareChallengeError(`Challenge detected: ${challenge.type}. Manual intervention required.`);
+  }
+  
+  console.log('Attempting to submit form...');
+  let submitSuccess = false;
+  
+  if (submitElement) {
+    try {
+      console.log('Attempting regular click on submit button...');
+      await submitElement.frame.click(submitElement.selector);
+      submitSuccess = true;
+      console.log('Submit button clicked successfully');
+    } catch (clickError) {
+      console.log(`Regular click failed: ${clickError.message}, trying page.evaluate...`);
+      
+      try {
+        submitSuccess = await submitElement.frame.evaluate((sel) => {
+          const element = document.querySelector(sel);
+          if (element && typeof element.click === 'function') {
+            element.click();
+            return true;
+          }
+          return false;
+        }, submitElement.selector);
+        
+        if (submitSuccess) {
+          console.log('Submit button clicked via page.evaluate');
+        }
+      } catch (evalError) {
+        console.log(`page.evaluate click failed: ${evalError.message}`);
+      }
+    }
+  }
+  
+  if (!submitSuccess) {
+    console.log('Submit button click failed or not available, pressing Enter on password field...');
+    try {
+      await passwordElement.frame.focus(passwordElement.selector);
+      await passwordElement.frame.keyboard.press('Enter');
+      submitSuccess = true;
+      console.log('Pressed Enter on password field');
+    } catch (enterError) {
+      console.log(`Enter press failed: ${enterError.message}`);
+      throw new Error('Failed to submit form via click or Enter');
+    }
+  }
+  
+  await page.waitForTimeout(1000);
+  
+  return submitSuccess;
+}
+
 async function handleRedirects() {
   console.log('Checking for redirects...');
   
@@ -502,33 +712,77 @@ async function login() {
             frame: emailElement.frame,
             selector: 'button, .btn, input[type="submit"], input[type="button"]'
           };
+        } else {
+          console.log('Submit button not found - will use Enter key fallback');
         }
-      }
-      
-      if (!submitElement) {
-        throw new Error('Submit button not found');
       }
       
       console.log(`Found email field with selector: ${emailElement.selector}`);
       console.log(`Found password field with selector: ${passwordElement.selector}`);
-      console.log(`Found submit button with selector: ${submitElement.selector}`);
+      if (submitElement) {
+        console.log(`Found submit button with selector: ${submitElement.selector}`);
+      } else {
+        console.log('No submit button found, will rely on Enter key');
+      }
       
-      await emailElement.frame.focus(emailElement.selector).catch(() => {});
-      await emailElement.frame.click(emailElement.selector, { clickCount: 3 }).catch(() => {});
-      await emailElement.frame.type(emailElement.selector, config.FALIX_EMAIL);
+      const maxSubmitAttempts = 3;
+      let submitAttempt = 0;
+      let loginSuccess = false;
       
-      await passwordElement.frame.focus(passwordElement.selector).catch(() => {});
-      await passwordElement.frame.type(passwordElement.selector, config.FALIX_PASSWORD);
+      while (submitAttempt < maxSubmitAttempts && !loginSuccess) {
+        submitAttempt++;
+        console.log(`Login submit attempt ${submitAttempt} of ${maxSubmitAttempts}...`);
+        
+        try {
+          await submitLoginForm(emailElement, passwordElement, submitElement);
+          
+          const outcome = await waitForPostSubmitOutcome(60000);
+          
+          if (outcome.success) {
+            console.log(`Login successful after ${submitAttempt} attempt(s)`);
+            loginSuccess = true;
+            break;
+          } else {
+            console.log(`Login attempt ${submitAttempt} failed: ${outcome.reason}`);
+            if (outcome.details) {
+              console.log(`Details: ${outcome.details}`);
+            }
+            
+            await captureDiagnosticInfo(`post-submit-attempt-${submitAttempt}`);
+            
+            if (submitAttempt < maxSubmitAttempts) {
+              const backoffMs = 1000 * submitAttempt;
+              console.log(`Waiting ${backoffMs}ms before retry...`);
+              await page.waitForTimeout(backoffMs);
+              
+              const currentUrl = page.url();
+              if (/\/auth(\/|$)/.test(currentUrl)) {
+                console.log('Still on auth page, reloading...');
+                await page.reload({ waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT });
+                await page.waitForTimeout(500);
+              }
+            }
+          }
+        } catch (submitError) {
+          console.log(`Submit attempt ${submitAttempt} threw error: ${submitError.message}`);
+          await captureDiagnosticInfo(`submit-error-attempt-${submitAttempt}`);
+          
+          if (submitAttempt >= maxSubmitAttempts) {
+            throw submitError;
+          }
+          
+          const backoffMs = 1000 * submitAttempt;
+          await page.waitForTimeout(backoffMs);
+        }
+      }
       
-      console.log('Submitting login form...');
-      await submitElement.frame.click(submitElement.selector);
-      await page.waitForTimeout(500);
-      await waitForLoginFormDismissed();
-      console.log(`Current URL after login submit: ${page.url()}`);
+      if (!loginSuccess) {
+        throw new Error(`Failed to login after ${maxSubmitAttempts} submit attempts`);
+      }
       
       await ensureNoCloudflareChallenge('post-login');
       
-      console.log('Login successful');
+      console.log('Login completed successfully');
       
     } catch (error) {
       if (error instanceof CloudflareChallengeError) {
