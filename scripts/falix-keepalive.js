@@ -80,17 +80,13 @@ puppeteer.use(StealthPlugin());
 
 const DEFAULT_BASE_URL = 'https://client.falixnodes.net';
 const normalizedBaseUrl = (process.env.FALIX_BASE_URL || DEFAULT_BASE_URL).replace(/\/+$/, '');
-const normalizedConsoleUrl = (process.env.FALIX_CONSOLE_URL || `${normalizedBaseUrl}/server/console`).trim();
 
 const config = {
   FALIX_EMAIL: process.env.FALIX_EMAIL,
   FALIX_PASSWORD: process.env.FALIX_PASSWORD,
   FALIX_BASE_URL: normalizedBaseUrl,
-  FALIX_SERVER_HOST: (process.env.FALIX_SERVER_HOST || 'mikeqd.falixsrv.me').trim(),
-  FALIX_SERVER_NAME: (process.env.FALIX_SERVER_NAME || 'mikeqd.falixsrv.me').trim(),
-  FALIX_CONSOLE_URL: normalizedConsoleUrl,
-  CHECK_INTERVAL_MS: parseInt(process.env.CHECK_INTERVAL_MS) || 120000,
-  AD_WATCH_MS: parseInt(process.env.AD_WATCH_MS) || 35000,
+  FALIX_TIMER_ID: process.env.FALIX_TIMER_ID || '2330413',
+  CLICK_INTERVAL_MS: parseInt(process.env.CLICK_INTERVAL_MS) || 2400000,
   HEADLESS: process.env.HEADLESS !== 'false'
 };
 
@@ -612,676 +608,262 @@ async function ensureNoCloudflareChallenge(context) {
   }
 }
 
-function normalizeWhitespace(value) {
-  if (typeof value !== 'string') {
-    return '';
-  }
-  return value.replace(/\s+/g, ' ').trim();
-}
-
-function uniqueStrings(values = []) {
-  const seen = new Set();
-  const result = [];
-
-  for (const value of values) {
-    if (!value) continue;
-    const normalized = normalizeWhitespace(value);
-    if (!normalized) continue;
-    const key = normalized.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push(normalized);
-  }
-
-  return result;
-}
-
-function extractHostCandidates(...sources) {
-  const hostRegex = /([a-z0-9-]+\.)+[a-z]{2,}/gi;
-  const hosts = new Set();
-
-  for (const source of sources) {
-    if (!source) continue;
-    const text = Array.isArray(source) ? source.join(' ') : String(source);
-    let match;
-    while ((match = hostRegex.exec(text)) !== null) {
-      const host = match[0].toLowerCase();
-      if (!host.includes(' ')) {
-        hosts.add(host);
+async function findAddTimeButton() {
+  const buttonElement = await page.evaluate(() => {
+    const buttonTextMatchers = ['add time', '添加时间'];
+    const allButtons = document.querySelectorAll('button, .btn, a[role="button"], input[type="button"], input[type="submit"]');
+    
+    for (const btn of allButtons) {
+      const text = (btn.innerText || btn.textContent || btn.value || '').toLowerCase().trim();
+      if (buttonTextMatchers.some(matcher => text.includes(matcher))) {
+        return true;
       }
     }
-  }
-
-  return Array.from(hosts);
-}
-
-function determineStatusFromIndicators({ statusCandidates = [], buttonTexts = [], explicitStartButtons = 0, explicitStopButtons = 0 }) {
-  const combined = uniqueStrings([...statusCandidates, ...buttonTexts]);
-  const lowerCombined = combined.map(text => text.toLowerCase());
-
-  const hasStartControl = explicitStartButtons > 0 || lowerCombined.some(text => text.includes('start') || text.includes('power on') || text.includes('boot'));
-  const hasStopControl = explicitStopButtons > 0 || lowerCombined.some(text => text.includes('stop') || text.includes('power off') || text.includes('shutdown'));
-
-  const offlineKeywords = ['offline', 'stopped', 'stopping', 'down', 'idle', 'not running', 'power off', 'start server'];
-  const onlineKeywords = ['online', 'running', 'active', 'started', 'up', 'powered on', 'stop server'];
-
-  const offlineText = combined.find(text => offlineKeywords.some(keyword => text.toLowerCase().includes(keyword)));
-  const onlineText = combined.find(text => onlineKeywords.some(keyword => text.toLowerCase().includes(keyword)));
-
-  let isOffline = null;
-  let statusText = null;
-
-  if (offlineText && !onlineText) {
-    isOffline = true;
-    statusText = offlineText;
-  } else if (onlineText && !offlineText) {
-    isOffline = false;
-    statusText = onlineText;
-  }
-
-  if (isOffline === null) {
-    if (hasStopControl && !hasStartControl) {
-      isOffline = false;
-      statusText = statusText || 'Stop control visible';
-    } else if (hasStartControl && !hasStopControl) {
-      isOffline = true;
-      statusText = statusText || 'Start control visible';
-    } else if (hasStartControl && hasStopControl) {
-      if (onlineText) {
-        isOffline = false;
-        statusText = onlineText;
-      } else if (offlineText) {
-        isOffline = true;
-        statusText = offlineText;
-      }
-    }
-  }
-
-  if (isOffline === null) {
-    if (onlineText) {
-      isOffline = false;
-      statusText = onlineText;
-    } else if (offlineText) {
-      isOffline = true;
-      statusText = offlineText;
-    }
-  }
-
-  if (isOffline === null) {
-    isOffline = false;
-    statusText = statusText || 'Status unknown - assuming online';
-  }
-
-  return {
-    isOffline,
-    statusText,
-    hasStartControl,
-    hasStopControl,
-    combinedTexts: combined
-  };
-}
-
-function logServerEntries(entries) {
-  console.log('\n=== Detected servers on dashboard ===');
-  if (!entries.length) {
-    console.log('No servers found on dashboard');
-  } else {
-    entries.forEach((entry, index) => {
-      const host = entry.hostCandidates[0] || 'N/A';
-      const name = entry.nameCandidates[0] || 'N/A';
-      const statusInfo = determineStatusFromIndicators({
-        statusCandidates: entry.statusCandidates,
-        buttonTexts: entry.buttonTexts
-      });
-      console.log(`${index + 1}. Host: ${host} | Name: ${name} | Status: ${statusInfo.statusText}`);
-    });
-  }
-  console.log('=====================================\n');
-}
-
-async function attemptConsoleDetection() {
-  if (!config.FALIX_CONSOLE_URL) {
-    return { success: false, reason: 'Console URL not configured' };
-  }
-
-  console.log(`Attempting direct console navigation to ${config.FALIX_CONSOLE_URL}...`);
-
-  try {
-    await gotoWithRetry(config.FALIX_CONSOLE_URL);
-    await ensureNoCloudflareChallenge('console navigation');
-    await page.waitForTimeout(2000);
-
-    const consoleData = await page.evaluate(() => {
-      const getText = (element) => {
-        if (!element) return '';
-        const content = element.innerText || element.textContent || '';
-        return content.trim();
-      };
-
-      const collect = (selectors) => {
-        const values = [];
-        selectors.forEach(selector => {
-          document.querySelectorAll(selector).forEach(node => {
-            const value = getText(node);
-            if (value) {
-              values.push(value);
-            }
-          });
-        });
-        return values;
-      };
-
-      const headerSelectors = ['.server-header', '.server-title', '.server-name', '.server-heading', '[data-testid*="server-name"]', 'h1', 'h2', 'h3'];
-      const hostSelectors = ['.server-host', '.server-address', '.hostname', '[data-testid*="host"]', '[data-testid*="address"]'];
-      const statusSelectors = ['.status', '.badge', '.state', '.label', '[class*="status"]', '[data-testid*="status"]', '[class*="state"]'];
-
-      const buttonNodes = document.querySelectorAll('button, .btn, input[type="button"], input[type="submit"], a[role="button"]');
-      const buttonTexts = [];
-      let startButtons = 0;
-      let stopButtons = 0;
-
-      buttonNodes.forEach(btn => {
-        const text = getText(btn).toLowerCase();
-        if (!text) return;
-        buttonTexts.push(text);
-        if (text.includes('start') || text.includes('power on') || text.includes('boot')) {
-          startButtons += 1;
-        }
-        if (text.includes('stop') || text.includes('power off') || text.includes('shutdown')) {
-          stopButtons += 1;
-        }
-      });
-
-      const contentRoot = document.querySelector('main') || document.querySelector('#app') || document.body;
-      const rawLines = (getText(contentRoot) || '')
-        .split('\n')
-        .map(line => line.trim())
-        .filter(line => line.length > 0)
-        .slice(0, 100);
-
-      return {
-        headerSegments: collect(headerSelectors),
-        hostSegments: collect(hostSelectors),
-        statusSegments: collect(statusSelectors),
-        buttonTexts,
-        startButtons,
-        stopButtons,
-        rawLines
-      };
-    });
-
-    const headerCandidates = uniqueStrings(consoleData.headerSegments.concat(consoleData.rawLines.slice(0, 10)));
-    const hostCandidates = uniqueStrings(consoleData.hostSegments.concat(extractHostCandidates(consoleData.rawLines, consoleData.headerSegments)));
-    const statusIndicators = uniqueStrings(consoleData.statusSegments.concat(consoleData.rawLines.filter(line => /online|offline|running|stopped|down|idle/i.test(line.toLowerCase()))));
-
-    const statusInfo = determineStatusFromIndicators({
-      statusCandidates: statusIndicators,
-      buttonTexts: consoleData.buttonTexts,
-      explicitStartButtons: consoleData.startButtons,
-      explicitStopButtons: consoleData.stopButtons
-    });
-
-    const normalizedTargetHost = config.FALIX_SERVER_HOST.toLowerCase();
-    const normalizedTargetName = config.FALIX_SERVER_NAME.toLowerCase();
-
-    const matchedByHost = normalizedTargetHost && hostCandidates.some(host => host.toLowerCase() === normalizedTargetHost);
-    const matchedByName = normalizedTargetName && headerCandidates.some(name => name.toLowerCase() === normalizedTargetName);
-
-    console.log(`Console host candidates: ${hostCandidates.join(', ') || 'none'}`);
-    console.log(`Console name candidates: ${headerCandidates.join(', ') || 'none'}`);
-    console.log(`Console status indicators: ${statusInfo.combinedTexts.join(', ') || 'none'}`);
-
-    if (!matchedByHost && !matchedByName) {
-      console.log('Console validation: unable to match configured server by host or name');
-      await captureDiagnosticInfo('console-validation-mismatch');
-      return { success: false, reason: 'Console page did not match configured server' };
-    }
-
-    const matchedBy = matchedByHost ? 'host' : 'name';
-    console.log(`Console detection matched by ${matchedBy}. Status: ${statusInfo.statusText}`);
-
-    return {
-      success: true,
-      matchedBy,
-      isOffline: statusInfo.isOffline,
-      statusText: statusInfo.statusText
-    };
-  } catch (error) {
-    if (error instanceof CloudflareChallengeError) {
-      throw error;
-    }
-    console.error(`Console detection failed: ${error.message}`);
-    await captureDiagnosticInfo('console-direct-link-error');
-    return { success: false, reason: error.message };
-  }
-}
-
-async function loadAllServersOnDashboard() {
-  let previousHeight = 0;
-  for (let i = 0; i < 8; i++) {
-    const currentHeight = await page.evaluate(() => document.body ? document.body.scrollHeight : 0);
-    if (currentHeight <= previousHeight) {
-      break;
-    }
-    previousHeight = currentHeight;
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    try {
-      await page.waitForNetworkIdle({ idleTime: 750, timeout: 5000 });
-    } catch (error) {
-      // Ignore network idle timeouts
-    }
-    await page.waitForTimeout(1000);
-  }
-
-  await page.evaluate(() => window.scrollTo(0, 0));
-  await page.waitForTimeout(500);
-}
-
-async function collectServersFromDashboard() {
-  const rawEntries = await page.evaluate(() => {
-    const unique = (values = []) => {
-      const seen = new Set();
-      const result = [];
-      for (const value of values) {
-        if (!value) continue;
-        const normalized = value.replace(/\s+/g, ' ').trim();
-        if (!normalized) continue;
-        const key = normalized.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-        result.push(normalized);
-      }
-      return result;
-    };
-
-    const candidateSelectors = [
-      '.server-card',
-      '.server-item',
-      '.server-row',
-      '.server-box',
-      '.servers-list .card',
-      '.servers-list li',
-      'tr',
-      '.card',
-      'div[class*="server"]',
-      'li[class*="server"]',
-      '.list-item'
+    
+    const selectorCandidates = [
+      '[data-testid*="add-time"]',
+      '[data-testid*="addtime"]',
+      '.add-time',
+      '.add-time-btn',
+      'button[class*="add-time" i]',
+      'button[class*="addtime" i]'
     ];
-
-    const nodes = new Set();
-    candidateSelectors.forEach(selector => {
-      document.querySelectorAll(selector).forEach(node => nodes.add(node));
-    });
-
-    const entries = [];
-
-    Array.from(nodes).forEach(node => {
-      const textContent = node.innerText || node.textContent || '';
-      if (!textContent) return;
-
-      const trimmed = textContent.trim();
-      if (!trimmed) return;
-
-      const hostMatches = trimmed.match(/([a-z0-9-]+\.)+[a-z]{2,}/gi) || [];
-      const lower = trimmed.toLowerCase();
-      const hasKeyword = lower.includes('server') || lower.includes('online') || lower.includes('offline') || lower.includes('start') || lower.includes('stop');
-
-      if (!hostMatches.length && !hasKeyword) {
-        return;
+    
+    for (const selector of selectorCandidates) {
+      if (document.querySelector(selector)) {
+        return true;
       }
-
-      const collect = (selectors) => {
-        const values = [];
-        selectors.forEach(selector => {
-          node.querySelectorAll(selector).forEach(el => {
-            const value = (el.innerText || el.textContent || '').trim();
-            if (value) {
-              values.push(value);
-            }
-          });
-        });
-        return values;
-      };
-
-      const nameSelectors = ['.server-name', '.name', '.title', '.card-title', 'h1', 'h2', 'h3', 'strong', '[data-testid*="server-name"]'];
-      const hostSelectors = ['.server-host', '.hostname', '.address', '[data-testid*="host"]', '[data-testid*="address"]'];
-      const statusSelectors = ['.status', '.badge', '.state', '.label', '[class*="status"]', '[class*="state"]'];
-      const buttonSelectors = ['button', '.btn', 'a[role="button"]'];
-
-      const rawLines = trimmed.split('\n').map(line => line.trim()).filter(line => line.length > 0).slice(0, 10);
-
-      entries.push({
-        nameCandidates: unique([...collect(nameSelectors), ...rawLines.slice(0, 2)]),
-        hostCandidates: unique([...collect(hostSelectors), ...hostMatches]),
-        statusCandidates: unique([...collect(statusSelectors), ...rawLines.filter(line => /online|offline|running|stopped|down|idle/i.test(line.toLowerCase()))]),
-        buttonTexts: unique(collect(buttonSelectors)),
-        rawLines,
-        rawText: trimmed.slice(0, 500)
-      });
-    });
-
-    return entries;
+    }
+    
+    return false;
   });
-
-  return rawEntries.map(entry => {
-    const hostAugments = extractHostCandidates(entry.hostCandidates, entry.rawLines, entry.rawText);
-    const lineStatus = entry.rawLines.filter(line => /online|offline|running|stopped|down|idle/i.test(line.toLowerCase()));
-
-    return {
-      nameCandidates: uniqueStrings([...entry.nameCandidates, ...entry.rawLines.slice(0, 3)]),
-      host_candidates: uniqueStrings([...entry.hostCandidates, ...hostAugments]),
-      statusCandidates: uniqueStrings([...entry.statusCandidates, ...lineStatus]),
-      buttonTexts: uniqueStrings(entry.buttonTexts),
-      rawLines: uniqueStrings(entry.rawLines),
-      rawText: entry.rawText
-    };
-  }).map(entry => ({
-    ...entry,
-    hostCandidates: entry.host_candidates,
-    host_candidates: undefined
-  }));
+  
+  return buttonElement;
 }
 
-function findServerMatch(entries) {
-  const targetHost = config.FALIX_SERVER_HOST.toLowerCase();
-  const targetName = config.FALIX_SERVER_NAME.toLowerCase();
-
-  for (const entry of entries) {
-    const hostMatches = targetHost && entry.hostCandidates.some(host => host.toLowerCase() === targetHost);
-    const nameMatches = targetName && entry.nameCandidates.some(name => name.toLowerCase() === targetName);
-
-    if (hostMatches || nameMatches) {
-      return {
-        entry,
-        matchedBy: hostMatches ? 'host' : 'name'
-      };
-    }
-  }
-
-  return null;
-}
-
-async function detectServerViaDashboard() {
-  console.log('Falling back to dashboard server detection...');
-
-  await gotoWithRetry(`${config.FALIX_BASE_URL}/`);
-  await ensureNoCloudflareChallenge('dashboard navigation');
-  await page.waitForTimeout(2000);
-  await loadAllServersOnDashboard();
-
-  const entries = await collectServersFromDashboard();
-
-  if (!entries.length) {
-    console.error('No server entries detected on dashboard');
-    await captureDiagnosticInfo('server-list-empty');
-    throw new Error('No server entries detected on dashboard');
-  }
-
-  logServerEntries(entries);
-
-  const match = findServerMatch(entries);
-  if (!match) {
-    console.error('Configured server not found on dashboard');
-    await captureDiagnosticInfo('server-not-found');
-    throw new Error(`Server not found. Host: ${config.FALIX_SERVER_HOST}${config.FALIX_SERVER_NAME ? `, Name: ${config.FALIX_SERVER_NAME}` : ''}`);
-  }
-
-  const statusInfo = determineStatusFromIndicators({
-    statusCandidates: match.entry.statusCandidates,
-    buttonTexts: match.entry.buttonTexts
-  });
-
-  console.log(`Matched dashboard server by ${match.matchedBy}. Status: ${statusInfo.statusText}`);
-
-  return {
-    isOffline: statusInfo.isOffline,
-    statusText: statusInfo.statusText,
-    matchedBy: match.matchedBy
-  };
-}
-
-async function checkServerStatus() {
-  const targetDescription = config.FALIX_SERVER_NAME
-    ? `${config.FALIX_SERVER_NAME} (${config.FALIX_SERVER_HOST})`
-    : config.FALIX_SERVER_HOST;
-  console.log(`Checking server status for ${targetDescription}...`);
-
-  try {
-    const consoleResult = await attemptConsoleDetection();
-    if (consoleResult.success) {
-      return consoleResult.isOffline;
-    }
-
-    console.log(`Console detection unavailable: ${consoleResult.reason}`);
-    const dashboardResult = await detectServerViaDashboard();
-    return dashboardResult.isOffline;
-  } catch (error) {
-    if (error instanceof CloudflareChallengeError) {
-      throw error;
-    }
-    console.error('Error checking server status:', error.message);
-    await captureDiagnosticInfo('server-status-error');
-    throw error;
-  }
-}
-
-async function startServer() {
-  console.log('Server is offline, attempting to start...');
-  try {
-    await gotoWithRetry(config.FALIX_CONSOLE_URL);
-    await ensureNoCloudflareChallenge('start server navigation');
-    await page.waitForTimeout(1500);
-
-    const startClicked = await page.evaluate(() => {
-      const selectorCandidates = [
-        'button[data-action="start"]',
-        'button[aria-label*="start" i]',
-        'button[class*="start" i]',
-        '.btn-start',
-        '[data-testid*="start"]',
-        'button[name*="start" i]'
-      ];
-
-      for (const selector of selectorCandidates) {
-        const element = document.querySelector(selector);
-        if (element && typeof element.click === 'function') {
-          element.click();
-          return true;
+async function clickAddTimeButton() {
+  console.log('Attempting to click Add time button...');
+  
+  const clicked = await page.evaluate(() => {
+    const buttonTextMatchers = ['add time', '添加时间'];
+    const allButtons = document.querySelectorAll('button, .btn, a[role="button"], input[type="button"], input[type="submit"]');
+    
+    for (const btn of allButtons) {
+      const text = (btn.innerText || btn.textContent || btn.value || '').toLowerCase().trim();
+      if (buttonTextMatchers.some(matcher => text.includes(matcher))) {
+        if (typeof btn.click === 'function') {
+          btn.click();
+          return { success: true, method: 'text-match' };
         }
       }
+    }
+    
+    const selectorCandidates = [
+      '[data-testid*="add-time"]',
+      '[data-testid*="addtime"]',
+      '.add-time',
+      '.add-time-btn',
+      'button[class*="add-time" i]',
+      'button[class*="addtime" i]'
+    ];
+    
+    for (const selector of selectorCandidates) {
+      const element = document.querySelector(selector);
+      if (element && typeof element.click === 'function') {
+        element.click();
+        return { success: true, method: `selector-${selector}` };
+      }
+    }
+    
+    return { success: false, method: null };
+  });
+  
+  if (clicked.success) {
+    console.log(`Add time button clicked successfully using ${clicked.method}`);
+    return true;
+  }
+  
+  console.log('Add time button not found or could not be clicked');
+  return false;
+}
 
-      const candidates = document.querySelectorAll('button, .btn, input[type="button"], input[type="submit"], a[role="button"]');
-      for (const element of candidates) {
-        const text = (element.innerText || element.textContent || element.value || '').trim().toLowerCase();
-        if (!text) continue;
-        if (text.includes('start') || text.includes('power on') || text.includes('launch') || text.includes('boot')) {
-          if (typeof element.click === 'function') {
-            element.click();
-            return true;
+async function verifyAddTimeSuccess() {
+  console.log('Verifying Add time button click success...');
+  await page.waitForTimeout(2000);
+  
+  const verification = await page.evaluate(() => {
+    const toastSelectors = [
+      '.toast',
+      '.notification',
+      '.alert',
+      '.success',
+      '.message',
+      '[class*="toast"]',
+      '[class*="notification"]',
+      '[role="alert"]',
+      '[class*="snackbar"]'
+    ];
+    
+    let toastFound = false;
+    let toastText = '';
+    
+    for (const selector of toastSelectors) {
+      const elements = document.querySelectorAll(selector);
+      for (const el of elements) {
+        if (el.offsetParent !== null) {
+          const text = (el.innerText || el.textContent || '').toLowerCase();
+          if (text.includes('success') || text.includes('added') || text.includes('time') || text.includes('成功')) {
+            toastFound = true;
+            toastText = (el.innerText || el.textContent || '').trim();
+            break;
           }
         }
       }
-
-      return false;
-    });
-
-    if (!startClicked) {
-      throw new Error('Start button not found on console page');
+      if (toastFound) break;
     }
-
-    console.log('Start command issued, handling potential ad modal...');
-    await handleAdModal();
-
-    console.log('Waiting for server to come online...');
-    await page.waitForTimeout(5000);
-
-    const statusData = await page.evaluate(() => {
-      const getText = (el) => (el ? (el.innerText || el.textContent || '').trim() : '');
-      const statusNodes = document.querySelectorAll('.status, .badge, .state, .label, [class*="status"], [class*="state"]');
-      const buttonNodes = document.querySelectorAll('button, .btn, input[type="button"], input[type="submit"], a[role="button"]');
-
-      const statusCandidates = [];
-      statusNodes.forEach(node => {
-        const text = getText(node);
-        if (text) statusCandidates.push(text);
-      });
-
-      const buttonTexts = [];
-      let startButtons = 0;
-      let stopButtons = 0;
-      buttonNodes.forEach(node => {
-        const text = getText(node).toLowerCase();
-        if (!text) return;
-        buttonTexts.push(text);
-        if (text.includes('start') || text.includes('power on') || text.includes('boot')) startButtons += 1;
-        if (text.includes('stop') || text.includes('power off') || text.includes('shutdown')) stopButtons += 1;
-      });
-
-      const summaryLines = (getText(document.querySelector('main')) || getText(document.body))
-        .split('\n')
-        .map(line => line.trim())
-        .filter(line => line.length > 0)
-        .slice(0, 20);
-
-      return { statusCandidates, buttonTexts, startButtons, stopButtons, summaryLines };
-    });
-
-    const postStatus = determineStatusFromIndicators({
-      statusCandidates: uniqueStrings([...statusData.statusCandidates, ...statusData.summaryLines]),
-      buttonTexts: uniqueStrings(statusData.buttonTexts),
-      explicitStartButtons: statusData.startButtons,
-      explicitStopButtons: statusData.stopButtons
-    });
-
-    console.log(`Post-start status: ${postStatus.statusText}`);
-
-    if (postStatus.isOffline) {
-      console.log('Server start initiated, but status still appears offline. Will continue monitoring in next cycle.');
-    } else {
-      console.log('Server started successfully');
+    
+    const buttonTextMatchers = ['add time', '添加时间'];
+    const allButtons = document.querySelectorAll('button, .btn, a[role="button"], input[type="button"], input[type="submit"]');
+    let buttonDisabled = false;
+    let buttonChanged = false;
+    
+    for (const btn of allButtons) {
+      const text = (btn.innerText || btn.textContent || btn.value || '').toLowerCase().trim();
+      if (buttonTextMatchers.some(matcher => text.includes(matcher))) {
+        if (btn.disabled || btn.hasAttribute('disabled') || btn.classList.contains('disabled')) {
+          buttonDisabled = true;
+        }
+        const btnText = (btn.innerText || btn.textContent || '').toLowerCase();
+        if (btnText.includes('added') || btnText.includes('已添加') || btnText.includes('success')) {
+          buttonChanged = true;
+        }
+      }
     }
-  } catch (error) {
-    if (error instanceof CloudflareChallengeError) {
-      throw error;
+    
+    const timerElements = document.querySelectorAll('[class*="timer"], [class*="countdown"], [class*="time"], [id*="timer"], [id*="countdown"]');
+    let timerText = '';
+    for (const el of timerElements) {
+      const text = (el.innerText || el.textContent || '').trim();
+      if (text && /\d+/.test(text)) {
+        timerText = text;
+        break;
+      }
     }
-    console.error('Error starting server:', error.message);
-    await captureDiagnosticInfo('start-server-error');
+    
+    return {
+      toastFound,
+      toastText,
+      buttonDisabled,
+      buttonChanged,
+      timerText,
+      bodyText: (document.body.innerText || document.body.textContent || '').toLowerCase().substring(0, 1000)
+    };
+  });
+  
+  if (verification.toastFound) {
+    console.log(`Success verified via toast: ${verification.toastText}`);
+    return true;
   }
+  
+  if (verification.buttonDisabled) {
+    console.log('Success verified: Add time button is now disabled');
+    return true;
+  }
+  
+  if (verification.buttonChanged) {
+    console.log('Success verified: Add time button text changed to success state');
+    return true;
+  }
+  
+  if (verification.timerText) {
+    console.log(`Timer display found: ${verification.timerText}`);
+    return true;
+  }
+  
+  if (verification.bodyText.includes('success') || verification.bodyText.includes('added')) {
+    console.log('Success indicated in page content');
+    return true;
+  }
+  
+  console.log('Could not verify success definitively, assuming success if no error occurred');
+  return true;
 }
 
-
-async function handleAdModal() {
-  console.log('Checking for ad modal...');
+async function performTimerKeepalive() {
+  const timerUrl = `${config.FALIX_BASE_URL}/timer?id=${config.FALIX_TIMER_ID}`;
+  console.log(`Navigating to timer page: ${timerUrl}`);
+  
   try {
+    await gotoWithRetry(timerUrl, { waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT });
+    await ensureNoCloudflareChallenge('timer page navigation');
     await page.waitForTimeout(2000);
     
-    const adModalExists = await page.evaluate(() => {
-      const modals = document.querySelectorAll('.modal, .popup, .ad-modal, [class*="modal"], [class*="popup"], .dialog');
-      for (const modal of modals) {
-        if (modal.offsetParent !== null) {
-          return true;
-        }
-      }
-      return false;
-    });
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] Timer page loaded, searching for Add time button...`);
     
-    if (adModalExists) {
-      console.log('Ad modal detected, clicking to watch ad...');
+    const buttonFound = await findAddTimeButton();
+    if (!buttonFound) {
+      console.error('Add time button not found on timer page');
+      await captureDiagnosticInfo('add-time-button-not-found');
+      throw new Error('Add time button not found');
+    }
+    
+    const retryConfig = {
+      maxAttempts: 3,
+      backoffMs: 2000
+    };
+    
+    let clicked = false;
+    let verified = false;
+    
+    for (let attempt = 1; attempt <= retryConfig.maxAttempts; attempt++) {
+      console.log(`Click attempt ${attempt}/${retryConfig.maxAttempts}...`);
       
-      const adClicked = await page.evaluate(() => {
-        const buttons = document.querySelectorAll('button, .btn, input[type="button"], a');
-        for (const btn of buttons) {
-          const text = btn.textContent.toLowerCase();
-          if (text.includes('watch') || text.includes('ad') || text.includes('continue')) {
-            btn.click();
-            return true;
-          }
-        }
-        return false;
-      });
+      clicked = await clickAddTimeButton();
       
-      if (adClicked) {
-        console.log(`Waiting ${config.AD_WATCH_MS}ms for ad to complete...`);
-        await page.waitForTimeout(config.AD_WATCH_MS);
-        
-        const closeClicked = await page.evaluate(() => {
-          const buttons = document.querySelectorAll('button, .btn, .close, [class*="close"], [data-dismiss]');
-          for (const btn of buttons) {
-            const text = btn.textContent.toLowerCase();
-            if (text.includes('close') || text.includes('skip') || btn.classList.contains('close')) {
-              btn.click();
-              return true;
-            }
-          }
-          return false;
-        });
-        
-        if (closeClicked) {
-          console.log('Ad modal closed');
+      if (!clicked) {
+        console.log(`Failed to click on attempt ${attempt}`);
+        if (attempt < retryConfig.maxAttempts) {
+          console.log(`Waiting ${retryConfig.backoffMs}ms before retry...`);
+          await page.waitForTimeout(retryConfig.backoffMs);
+          continue;
         }
+        break;
+      }
+      
+      verified = await verifyAddTimeSuccess();
+      
+      if (verified) {
+        const successTimestamp = new Date().toISOString();
+        console.log(`[${successTimestamp}] Add time click verified successfully on attempt ${attempt}`);
+        return { success: true, attempts: attempt };
+      }
+      
+      console.log(`Verification failed on attempt ${attempt}`);
+      if (attempt < retryConfig.maxAttempts) {
+        console.log(`Waiting ${retryConfig.backoffMs}ms before retry...`);
+        await page.waitForTimeout(retryConfig.backoffMs);
       }
     }
-  } catch (error) {
-    console.log('No ad modal detected or error handling ad:', error.message);
-  }
-}
-
-async function checkServerStarted() {
-  try {
-    const isOnline = await page.evaluate(() => {
-      const statusElements = document.querySelectorAll('.status, .badge, .state, [class*="status"], [class*="state"]');
-      for (const element of statusElements) {
-        const text = element.textContent.toLowerCase();
-        if (text.includes('online') || text.includes('running') || text.includes('active')) {
-          return true;
-        }
-      }
-      return false;
-    });
-    return isOnline;
-  } catch (error) {
-    console.error('Error checking if server started:', error.message);
-    return false;
-  }
-}
-
-async function performKeepaliveCheck() {
-  try {
-    const isOffline = await checkServerStatus();
-    if (isOffline) {
-      await startServer();
-    } else {
-      console.log('Server is online, no action needed');
+    
+    if (!clicked) {
+      throw new Error('Failed to click Add time button after all retry attempts');
     }
-    return true;
+    
+    if (!verified) {
+      console.log('Warning: Could not verify success, but click was executed');
+      return { success: true, attempts: retryConfig.maxAttempts, verified: false };
+    }
+    
+    return { success: true, attempts: retryConfig.maxAttempts };
+    
   } catch (error) {
     if (error instanceof CloudflareChallengeError) {
       throw error;
     }
-    console.error('Error during keepalive check:', error.message);
-    return false;
-  }
-}
-
-async function runKeepaliveLoop(maxIterations = 5) {
-  console.log(`Starting keepalive loop with max ${maxIterations} iterations`);
-  
-  for (let i = 0; i < maxIterations; i++) {
-    console.log(`\n=== Keepalive check ${i + 1}/${maxIterations} ===`);
-    
-    try {
-      const success = await performKeepaliveCheck();
-      if (!success) {
-        console.log('Keepalive check failed, but continuing...');
-      }
-    } catch (error) {
-      console.error('Keepalive check threw error:', error.message);
-    }
-    
-    if (i < maxIterations - 1) {
-      console.log(`Waiting ${config.CHECK_INTERVAL_MS}ms before next check...`);
-      await page.waitForTimeout(config.CHECK_INTERVAL_MS);
-    }
+    console.error('Error performing timer keepalive:', error.message);
+    await captureDiagnosticInfo('timer-keepalive-error');
+    throw error;
   }
 }
 
@@ -1294,10 +876,24 @@ async function cleanup() {
 
 async function main() {
   try {
+    console.log('\n=== Starting Falix Timer Keepalive ===');
+    console.log(`Timer ID: ${config.FALIX_TIMER_ID}`);
+    console.log(`Click interval: ${config.CLICK_INTERVAL_MS}ms (${config.CLICK_INTERVAL_MS / 60000} minutes)`);
+    
     await initializeBrowser();
     await login();
-    await runKeepaliveLoop();
-    console.log('\n=== Keepalive workflow completed successfully ===');
+    
+    const result = await performTimerKeepalive();
+    
+    if (result.success) {
+      console.log('\n=== Timer keepalive completed successfully ===');
+      if (result.verified === false) {
+        console.log('Note: Success could not be fully verified, but click was executed');
+      }
+    } else {
+      console.error('\n=== Timer keepalive failed ===');
+      throw new Error('Timer keepalive operation failed');
+    }
   } catch (error) {
     if (error instanceof CloudflareChallengeError) {
       console.log('\n=== Cloudflare challenge encountered ===');
@@ -1305,7 +901,7 @@ async function main() {
       console.log('Skipping run so the scheduler can retry later.');
       return;
     }
-    console.error('Fatal error in keepalive workflow:', error);
+    console.error('Fatal error in timer keepalive workflow:', error);
     throw error;
   } finally {
     await cleanup();

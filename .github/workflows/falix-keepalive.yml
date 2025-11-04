@@ -1,14 +1,14 @@
-name: Falix Keepalive Bot
+name: Falix Timer Keepalive Bot
 
 on:
   push:
     branches: [main]
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/40 * * * *'
   workflow_dispatch:
 
 jobs:
-  keepalive:
+  timer-keepalive:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     
@@ -32,14 +32,13 @@ jobs:
     - name: Install dependencies
       run: npm ci
     
-    - name: Run Falix keepalive bot
+    - name: Run Falix timer keepalive (Add time click)
       env:
         FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
         FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
         FALIX_BASE_URL: ${{ secrets.FALIX_BASE_URL || 'https://client.falixnodes.net' }}
-        FALIX_SERVER_HOST: ${{ secrets.FALIX_SERVER_HOST || 'mikeqd.falixsrv.me' }}
-        CHECK_INTERVAL_MS: ${{ secrets.CHECK_INTERVAL_MS || '120000' }}
-        AD_WATCH_MS: ${{ secrets.AD_WATCH_MS || '35000' }}
+        FALIX_TIMER_ID: ${{ secrets.FALIX_TIMER_ID || '2330413' }}
+        CLICK_INTERVAL_MS: ${{ secrets.CLICK_INTERVAL_MS || '2400000' }}
         HEADLESS: ${{ secrets.HEADLESS || 'true' }}
       run: npm run keepalive
     
