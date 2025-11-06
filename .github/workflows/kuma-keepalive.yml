@@ -1,0 +1,88 @@
+name: Uptime Kuma Keepalive Trigger
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for triggering keepalive'
+        required: false
+        type: string
+        default: 'Manual trigger'
+  repository_dispatch:
+    types: [kuma-falix-keepalive]
+
+concurrency:
+  group: kuma-keepalive-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  kuma-keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    strategy:
+      matrix:
+        node-version: [20.x]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+    
+    - name: Create screenshots directory
+      run: mkdir -p ./screenshots
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run Falix keepalive (Kuma triggered)
+      env:
+        FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
+        FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
+        FALIX_BASE_URL: ${{ secrets.FALIX_BASE_URL || 'https://client.falixnodes.net' }}
+        FALIX_TIMER_ID: ${{ secrets.FALIX_TIMER_ID || '2330413' }}
+        ACTION: ${{ github.event.inputs.action || 'add_time' }}
+        HEADLESS: ${{ secrets.HEADLESS || 'true' }}
+        CHROME_ARGS: ${{ secrets.CHROME_ARGS || '--no-sandbox --disable-dev-shm-usage' }}
+        KUMA_PUSH_URL: ${{ secrets.KUMA_PUSH_URL }}
+        TRIGGER_REASON: ${{ github.event.inputs.reason || github.event.client_payload.reason || 'Repository dispatch' }}
+      run: npm run keepalive
+    
+    - name: Send heartbeat to Uptime Kuma
+      if: success() && env.KUMA_PUSH_URL != ''
+      run: |
+        curl -s -o /dev/null -w "%{http_code}" "${{ secrets.KUMA_PUSH_URL }}" || echo "Heartbeat failed"
+    
+    - name: Upload screenshots
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: kuma-screenshots-${{ github.run_number }}
+        path: ./screenshots/
+        retention-days: 7
+        if-no-files-found: ignore
+    
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: kuma-logs-${{ github.run_number }}
+        path: |
+          /tmp/falix-*.html
+          /tmp/falix-*.png
+        retention-days: 7
+        if-no-files-found: ignore
+    
+    - name: Notify trigger result
+      if: always() && env.KUMA_PUSH_URL != ''
+      run: |
+        if [ "${{ job.status }}" == "success" ]; then
+          curl -s -o /dev/null "${{ secrets.KUMA_PUSH_URL }}/ok" || echo "Success notification failed"
+        else
+          curl -s -o /dev/null "${{ secrets.KUMA_PUSH_URL }}/fail" || echo "Failure notification failed"
+        fi
