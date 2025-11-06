@@ -89,6 +89,9 @@ public
 tmp/
 temp/
 
+# Screenshots directory
+screenshots/
+
 # Logs
 logs
 *.log

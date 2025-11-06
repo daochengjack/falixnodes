@@ -108,6 +108,93 @@ The bot verifies success through multiple indicators:
 
 Set `HEADLESS=false` to watch the bot's actions in a visible browser window for debugging.
 
+## Uptime Kuma Integration
+
+This bot can be triggered by Uptime Kuma when your server goes down, providing automatic recovery.
+
+### Setup
+
+1. **Add Repository Secrets:**
+   - `KUMA_PUSH_URL`: Your Uptime Kuma push URL (optional)
+   - All required secrets from the main setup
+
+2. **Configure Uptime Kuma Webhook:**
+   
+   In your Uptime Kuma monitor, add a webhook notification with these settings:
+   
+   ```bash
+   # Webhook URL
+   https://api.github.com/repos/daochengjack/falixnodes/dispatches
+   
+   # Headers
+   Authorization: token YOUR_GITHUB_PERSONAL_ACCESS_TOKEN
+   Accept: application/vnd.github.v3+json
+   Content-Type: application/json
+   
+   # POST Body (for DOWN events)
+   {
+     "event_type": "kuma-falix-keepalive",
+     "client_payload": {
+       "reason": "Server DOWN - Uptime Kuma alert",
+       "action": "ensure_running"
+     }
+   }
+   ```
+
+3. **GitHub Personal Access Token:**
+   - Create a PAT with `repo` scope
+   - Add it as the `Authorization` header value: `token ghp_xxxxxxxxxxxx`
+
+### Webhook Examples
+
+**Manual trigger via GitHub API:**
+```bash
+curl -X POST \
+  -H "Authorization: token YOUR_PAT" \
+  -H "Accept: application/vnd.github.v3+json" \
+  -H "Content-Type: application/json" \
+  https://api.github.com/repos/daochengjack/falixnodes/dispatches \
+  -d '{
+    "event_type": "kuma-falix-keepalive",
+    "client_payload": {
+      "reason": "Manual test trigger",
+      "action": "add_time"
+    }
+  }'
+```
+
+**Manual trigger via GitHub UI:**
+- Go to Actions → Uptime Kuma Keepalive Trigger → Run workflow
+- Optionally provide a reason for the trigger
+
+### Action Modes
+
+- `add_time`: Clicks "Add time" button (default)
+- `ensure_running`: Ensures server is started (finds and clicks Start button if needed)
+
+### Workflow Features
+
+- **Concurrency Control**: Prevents overlapping runs
+- **Artifact Upload**: Screenshots and logs saved for 7 days
+- **Heartbeat**: Optional heartbeat sent to Kuma on success
+- **Safe Screenshots**: Saved to `./screenshots/` directory
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FALIX_EMAIL` | - | Your Falix account email (required) |
+| `FALIX_PASSWORD` | - | Your Falix account password (required) |
+| `FALIX_BASE_URL` | `https://client.falixnodes.net` | Falix client base URL |
+| `FALIX_TIMER_ID` | `2330413` | Timer ID for the timer page |
+| `CLICK_INTERVAL_MS` | `2400000` | Click interval in milliseconds (40 minutes) |
+| `HEADLESS` | `true` | Whether to run browser in headless mode |
+| `ACTION` | `add_time` | Action mode: `add_time` or `ensure_running` |
+| `CHROME_ARGS` | `--no-sandbox --disable-dev-shm-usage` | Chrome launch arguments |
+| `SCREENSHOT_DIR` | `./screenshots` | Directory to save screenshots |
+| `TRIGGER_REASON` | `Manual run` | Reason for triggering the workflow |
+| `KUMA_PUSH_URL` | - | Uptime Kuma push URL for heartbeat (optional) |
+
 ## Dependencies
 
 - `puppeteer`: Browser automation

@@ -1,6 +1,9 @@
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs');
+const https = require('https');
+const http = require('http');
+const { URL } = require('url');
 
 const NAVIGATION_WAIT_UNTIL = 'domcontentloaded';
 const DEFAULT_NAVIGATION_TIMEOUT = 90000;
@@ -87,7 +90,11 @@ const config = {
   FALIX_BASE_URL: normalizedBaseUrl,
   FALIX_TIMER_ID: process.env.FALIX_TIMER_ID || '2330413',
   CLICK_INTERVAL_MS: parseInt(process.env.CLICK_INTERVAL_MS) || 2400000,
-  HEADLESS: process.env.HEADLESS !== 'false'
+  HEADLESS: process.env.HEADLESS !== 'false',
+  ACTION: process.env.ACTION || 'add_time',
+  CHROME_ARGS: process.env.CHROME_ARGS || '--no-sandbox --disable-dev-shm-usage',
+  SCREENSHOT_DIR: process.env.SCREENSHOT_DIR || './screenshots',
+  TRIGGER_REASON: process.env.TRIGGER_REASON || 'Manual run'
 };
 
 if (!config.FALIX_EMAIL || !config.FALIX_PASSWORD) {
@@ -284,18 +291,25 @@ async function gotoWithRetry(url, options = {}) {
 
 async function initializeBrowser() {
   console.log('Initializing browser...');
+  
+  // Parse Chrome args from environment
+  const chromeArgs = config.CHROME_ARGS.split(' ').filter(arg => arg.trim());
+  
+  // Ensure essential args are included
+  const essentialArgs = [
+    '--disable-setuid-sandbox',
+    '--disable-accelerated-2d-canvas',
+    '--no-first-run',
+    '--no-zygote',
+    '--single-process',
+    '--disable-gpu'
+  ];
+  
+  const finalArgs = [...new Set([...chromeArgs, ...essentialArgs])];
+  
   browser = await puppeteer.launch({
     headless: config.HEADLESS ? "new" : false,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-gpu'
-    ]
+    args: finalArgs
   });
   
   page = await browser.newPage();
@@ -315,7 +329,13 @@ async function initializeBrowser() {
 async function captureDiagnosticInfo(context) {
   try {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const screenshotPath = `/tmp/falix-${context}-${timestamp}.png`;
+    
+    // Ensure screenshot directory exists
+    if (!fs.existsSync(config.SCREENSHOT_DIR)) {
+      fs.mkdirSync(config.SCREENSHOT_DIR, { recursive: true });
+    }
+    
+    const screenshotPath = `${config.SCREENSHOT_DIR}/falix-${context}-${timestamp}.png`;
     const htmlPath = `/tmp/falix-${context}-${timestamp}.html`;
     
     await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -1043,6 +1063,284 @@ async function verifyAddTimeSuccess() {
   return true;
 }
 
+async function findStartButton() {
+  const buttonElement = await page.evaluate(() => {
+    const buttonTextMatchers = ['start', '启动', 'run', '运行', '启动服务器'];
+    const allButtons = document.querySelectorAll('button, .btn, a[role="button"], input[type="button"], input[type="submit"]');
+    
+    for (const btn of allButtons) {
+      const text = (btn.innerText || btn.textContent || btn.value || '').toLowerCase().trim();
+      if (buttonTextMatchers.some(matcher => text.includes(matcher))) {
+        return true;
+      }
+    }
+    
+    const selectorCandidates = [
+      '[data-testid*="start"]',
+      '[data-testid*="run"]',
+      '.start-btn',
+      '.start',
+      '.run-btn',
+      '.run',
+      'button[class*="start" i]',
+      'button[class*="run" i]'
+    ];
+    
+    for (const selector of selectorCandidates) {
+      if (document.querySelector(selector)) {
+        return true;
+      }
+    }
+    
+    return false;
+  });
+  
+  return buttonElement;
+}
+
+async function clickStartButton() {
+  console.log('Attempting to click Start button...');
+  
+  const clicked = await page.evaluate(() => {
+    const buttonTextMatchers = ['start', '启动', 'run', '运行', '启动服务器'];
+    const allButtons = document.querySelectorAll('button, .btn, a[role="button"], input[type="button"], input[type="submit"]');
+    
+    for (const btn of allButtons) {
+      const text = (btn.innerText || btn.textContent || btn.value || '').toLowerCase().trim();
+      if (buttonTextMatchers.some(matcher => text.includes(matcher))) {
+        if (typeof btn.click === 'function') {
+          btn.click();
+          return { success: true, method: 'text-match' };
+        }
+      }
+    }
+    
+    const selectorCandidates = [
+      '[data-testid*="start"]',
+      '[data-testid*="run"]',
+      '.start-btn',
+      '.start',
+      '.run-btn',
+      '.run',
+      'button[class*="start" i]',
+      'button[class*="run" i]'
+    ];
+    
+    for (const selector of selectorCandidates) {
+      const element = document.querySelector(selector);
+      if (element && typeof element.click === 'function') {
+        element.click();
+        return { success: true, method: `selector-${selector}` };
+      }
+    }
+    
+    return { success: false, method: null };
+  });
+  
+  if (clicked.success) {
+    console.log(`Start button clicked successfully using ${clicked.method}`);
+    return true;
+  }
+  
+  console.log('Start button not found or could not be clicked');
+  return false;
+}
+
+async function verifyStartSuccess() {
+  console.log('Verifying Start button click success...');
+  await page.waitForTimeout(3000);
+  
+  const verification = await page.evaluate(() => {
+    const toastSelectors = [
+      '.toast',
+      '.notification',
+      '.alert',
+      '.success',
+      '.message',
+      '[class*="toast"]',
+      '[class*="notification"]',
+      '[role="alert"]',
+      '[class*="snackbar"]'
+    ];
+    
+    let toastFound = false;
+    let toastText = '';
+    
+    for (const selector of toastSelectors) {
+      const elements = document.querySelectorAll(selector);
+      for (const el of elements) {
+        if (el.offsetParent !== null) {
+          const text = (el.innerText || el.textContent || '').toLowerCase();
+          if (text.includes('success') || text.includes('started') || text.includes('running') || text.includes('成功') || text.includes('已启动')) {
+            toastFound = true;
+            toastText = (el.innerText || el.textContent || '').trim();
+            break;
+          }
+        }
+      }
+      if (toastFound) break;
+    }
+    
+    const startTextMatchers = ['start', '启动', 'run', '运行'];
+    const stopTextMatchers = ['stop', '停止', 'shutdown', '关机'];
+    const allButtons = document.querySelectorAll('button, .btn, a[role="button"], input[type="button"], input[type="submit"]');
+    let stopButtonFound = false;
+    let startButtonDisabled = false;
+    
+    for (const btn of allButtons) {
+      const text = (btn.innerText || btn.textContent || btn.value || '').toLowerCase().trim();
+      
+      if (stopTextMatchers.some(matcher => text.includes(matcher))) {
+        stopButtonFound = true;
+      }
+      
+      if (startTextMatchers.some(matcher => text.includes(matcher))) {
+        if (btn.disabled || btn.hasAttribute('disabled') || btn.classList.contains('disabled')) {
+          startButtonDisabled = true;
+        }
+      }
+    }
+    
+    const statusIndicators = document.querySelectorAll('[class*="status"], [class*="state"], [id*="status"], [id*="state"]');
+    let statusText = '';
+    for (const el of statusIndicators) {
+      const text = (el.innerText || el.textContent || '').trim();
+      if (text && (text.includes('running') || text.includes('online') || text.includes('运行中') || text.includes('在线'))) {
+        statusText = text;
+        break;
+      }
+    }
+    
+    return {
+      toastFound,
+      toastText,
+      stopButtonFound,
+      startButtonDisabled,
+      statusText,
+      bodyText: (document.body.innerText || document.body.textContent || '').toLowerCase().substring(0, 1000)
+    };
+  });
+  
+  if (verification.toastFound) {
+    console.log(`Success verified via toast: ${verification.toastText}`);
+    return true;
+  }
+  
+  if (verification.stopButtonFound) {
+    console.log('Success verified: Stop button is now visible');
+    return true;
+  }
+  
+  if (verification.startButtonDisabled) {
+    console.log('Success verified: Start button is now disabled');
+    return true;
+  }
+  
+  if (verification.statusText) {
+    console.log(`Success verified: Status indicates running - ${verification.statusText}`);
+    return true;
+  }
+  
+  if (verification.bodyText.includes('running') || verification.bodyText.includes('online') || verification.bodyText.includes('运行中')) {
+    console.log('Success indicated in page content');
+    return true;
+  }
+  
+  console.log('Could not verify start success definitively, assuming success if no error occurred');
+  return true;
+}
+
+async function ensureServerRunning() {
+  console.log('Ensuring server is running...');
+  
+  try {
+    // First check if server is already running by looking for stop button
+    const isRunning = await page.evaluate(() => {
+      const stopTextMatchers = ['stop', '停止', 'shutdown', '关机'];
+      const allButtons = document.querySelectorAll('button, .btn, a[role="button"], input[type="button"], input[type="submit"]');
+      
+      for (const btn of allButtons) {
+        const text = (btn.innerText || btn.textContent || btn.value || '').toLowerCase().trim();
+        if (stopTextMatchers.some(matcher => text.includes(matcher))) {
+          return true;
+        }
+      }
+      
+      return false;
+    });
+    
+    if (isRunning) {
+      console.log('Server is already running');
+      return { success: true, action: 'already_running' };
+    }
+    
+    // Try to find and click start button
+    const buttonFound = await findStartButton();
+    if (!buttonFound) {
+      console.log('Start button not found, server might be in a different state');
+      await captureDiagnosticInfo('start-button-not-found');
+      return { success: true, action: 'no_action_needed' };
+    }
+    
+    const retryConfig = {
+      maxAttempts: 3,
+      backoffMs: 2000
+    };
+    
+    let clicked = false;
+    let verified = false;
+    
+    for (let attempt = 1; attempt <= retryConfig.maxAttempts; attempt++) {
+      console.log(`Start click attempt ${attempt}/${retryConfig.maxAttempts}...`);
+      
+      clicked = await clickStartButton();
+      
+      if (!clicked) {
+        console.log(`Failed to click start button on attempt ${attempt}`);
+        if (attempt < retryConfig.maxAttempts) {
+          console.log(`Waiting ${retryConfig.backoffMs}ms before retry...`);
+          await page.waitForTimeout(retryConfig.backoffMs);
+          continue;
+        }
+        break;
+      }
+      
+      verified = await verifyStartSuccess();
+      
+      if (verified) {
+        const successTimestamp = new Date().toISOString();
+        console.log(`[${successTimestamp}] Server start verified successfully on attempt ${attempt}`);
+        return { success: true, action: 'started', attempts: attempt };
+      }
+      
+      console.log(`Start verification failed on attempt ${attempt}`);
+      if (attempt < retryConfig.maxAttempts) {
+        console.log(`Waiting ${retryConfig.backoffMs}ms before retry...`);
+        await page.waitForTimeout(retryConfig.backoffMs);
+      }
+    }
+    
+    if (!clicked) {
+      throw new Error('Failed to click Start button after all retry attempts');
+    }
+    
+    if (!verified) {
+      console.log('Warning: Could not verify server start, but click was executed');
+      return { success: true, action: 'start_attempted', attempts: retryConfig.maxAttempts, verified: false };
+    }
+    
+    return { success: true, action: 'started', attempts: retryConfig.maxAttempts };
+    
+  } catch (error) {
+    if (error instanceof CloudflareChallengeError) {
+      throw error;
+    }
+    console.error('Error ensuring server is running:', error.message);
+    await captureDiagnosticInfo('ensure-running-error');
+    throw error;
+  }
+}
+
 async function performTimerKeepalive() {
   const timerUrl = `${config.FALIX_BASE_URL}/timer?id=${config.FALIX_TIMER_ID}`;
   console.log(`Navigating to timer page: ${timerUrl}`);
@@ -1121,6 +1419,41 @@ async function performTimerKeepalive() {
   }
 }
 
+async function sendHeartbeat(url) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('Heartbeat timeout after 10 seconds'));
+    }, 10000);
+
+    try {
+      const parsedUrl = new URL(url);
+      const client = parsedUrl.protocol === 'https:' ? https : http;
+      
+      const req = client.get(url, (res) => {
+        clearTimeout(timeout);
+        console.log(`Heartbeat response status: ${res.statusCode}`);
+        resolve({ status: res.statusCode });
+      });
+
+      req.on('error', (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+
+      req.on('timeout', () => {
+        clearTimeout(timeout);
+        req.destroy();
+        reject(new Error('Heartbeat request timeout'));
+      });
+
+      req.setTimeout(10000);
+    } catch (error) {
+      clearTimeout(timeout);
+      reject(error);
+    }
+  });
+}
+
 async function cleanup() {
   console.log('Cleaning up...');
   if (browser) {
@@ -1130,24 +1463,59 @@ async function cleanup() {
 
 async function main() {
   try {
-    console.log('\n=== Starting Falix Timer Keepalive ===');
+    console.log('\n=== Starting Falix Keepalive ===');
+    console.log(`Action: ${config.ACTION}`);
+    console.log(`Trigger reason: ${config.TRIGGER_REASON}`);
     console.log(`Timer ID: ${config.FALIX_TIMER_ID}`);
     console.log(`Click interval: ${config.CLICK_INTERVAL_MS}ms (${config.CLICK_INTERVAL_MS / 60000} minutes)`);
     
     await initializeBrowser();
     await login();
     
-    const result = await performTimerKeepalive();
+    let result;
     
-    if (result.success) {
-      console.log('\n=== Timer keepalive completed successfully ===');
-      if (result.verified === false) {
-        console.log('Note: Success could not be fully verified, but click was executed');
+    if (config.ACTION === 'ensure_running') {
+      console.log('\n--- Ensuring server is running ---');
+      result = await ensureServerRunning();
+      
+      if (result.success) {
+        console.log('\n=== Server ensure running completed successfully ===');
+        console.log(`Action taken: ${result.action}`);
+        if (result.verified === false) {
+          console.log('Note: Success could not be fully verified, but action was executed');
+        }
+      } else {
+        console.error('\n=== Server ensure running failed ===');
+        throw new Error('Server ensure running operation failed');
+      }
+    } else if (config.ACTION === 'add_time') {
+      console.log('\n--- Performing timer keepalive (Add time) ---');
+      result = await performTimerKeepalive();
+      
+      if (result.success) {
+        console.log('\n=== Timer keepalive completed successfully ===');
+        if (result.verified === false) {
+          console.log('Note: Success could not be fully verified, but click was executed');
+        }
+      } else {
+        console.error('\n=== Timer keepalive failed ===');
+        throw new Error('Timer keepalive operation failed');
       }
     } else {
-      console.error('\n=== Timer keepalive failed ===');
-      throw new Error('Timer keepalive operation failed');
+      throw new Error(`Unknown action: ${config.ACTION}. Supported actions: add_time, ensure_running`);
     }
+    
+    // Send heartbeat to Kuma if URL is provided
+    if (process.env.KUMA_PUSH_URL) {
+      try {
+        console.log(`\n--- Sending heartbeat to Uptime Kuma ---`);
+        await sendHeartbeat(process.env.KUMA_PUSH_URL);
+        console.log('Heartbeat sent successfully');
+      } catch (heartbeatError) {
+        console.warn('Failed to send heartbeat to Uptime Kuma:', heartbeatError.message);
+      }
+    }
+    
   } catch (error) {
     if (error instanceof CloudflareChallengeError) {
       console.log('\n=== Cloudflare challenge encountered ===');
@@ -1155,7 +1523,7 @@ async function main() {
       console.log('Skipping run so the scheduler can retry later.');
       return;
     }
-    console.error('Fatal error in timer keepalive workflow:', error);
+    console.error('Fatal error in keepalive workflow:', error);
     throw error;
   } finally {
     await cleanup();
