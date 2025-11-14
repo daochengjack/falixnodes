@@ -37,7 +37,10 @@ jobs:
         FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
         FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
         FALIX_BASE_URL: ${{ secrets.FALIX_BASE_URL || 'https://client.falixnodes.net' }}
-        FALIX_TIMER_ID: ${{ secrets.FALIX_TIMER_ID || '2330413' }}
+        FALIX_SERVER_ID: ${{ secrets.FALIX_SERVER_ID }}
+        FALIX_TIMER_ID: ${{ secrets.FALIX_TIMER_ID || secrets.FALIX_SERVER_ID }}
+        TIMER_INTERVAL: ${{ secrets.TIMER_INTERVAL || '3600' }}
+        TIMER_ENABLE: ${{ secrets.TIMER_ENABLE || 'true' }}
         CLICK_INTERVAL_MS: ${{ secrets.CLICK_INTERVAL_MS || '2400000' }}
         HEADLESS: ${{ secrets.HEADLESS || 'true' }}
       run: npm run keepalive

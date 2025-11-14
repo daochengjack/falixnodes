@@ -1,9 +1,18 @@
 # Falix Timer Keepalive Bot
 
-An automated bot that keeps your Falix timer alive by clicking "Add time" every 40 minutes.
+An automated bot that keeps your Falix timer alive using both HTTP-based auto-timer requests and browser-based clicking.
 
 ## Features
 
+### Auto-Timer (HTTP-based)
+- **Automatic timer extension** via direct HTTP GET requests to `https://client.falixnodes.net/timer?id={serverId}`
+- **Configurable interval**: Run every N seconds (default: 3600 seconds = 1 hour)
+- **Real browser headers**: Mimics authentic browser requests with User-Agent, Referer, and standard headers
+- **Retry mechanism**: Automatic retries with exponential backoff on failure
+- **Session-aware**: Reuses saved session cookies and gracefully reports when authentication is required
+- **Runs alongside browser-based keepalive**: Both methods work together seamlessly
+
+### Browser-Based Keepalive
 - Automatically logs into your Falix account using credentials
 - Navigates to timer page and clicks "Add time" button
 - Verifies success through toast messages, button state, or countdown changes
@@ -21,10 +30,12 @@ Add the following secrets to your GitHub repository:
 **Required:**
 - `FALIX_EMAIL`: Your Falix account email
 - `FALIX_PASSWORD`: Your Falix account password
+- `FALIX_SERVER_ID`: Your Falix server ID (used for both auto-timer and browser keepalive)
 
 **Optional:**
 - `FALIX_BASE_URL`: Base URL (default: `https://client.falixnodes.net`)
-- `FALIX_TIMER_ID`: Timer ID for the timer page (default: `2330413`)
+- `TIMER_INTERVAL`: Auto-timer interval in seconds (default: `3600` = 1 hour)
+- `TIMER_ENABLE`: Enable auto-timer (default: `true`)
 - `CLICK_INTERVAL_MS`: Click interval in milliseconds (default: `2400000` = 40 minutes)
 - `HEADLESS`: Run in headless mode (default: `true`)
 
@@ -39,8 +50,11 @@ Set environment variables:
 ```bash
 export FALIX_EMAIL="your-email@example.com"
 export FALIX_PASSWORD="your-password"
+export FALIX_SERVER_ID="your-server-id"
+
 # Optional overrides
-export FALIX_TIMER_ID="2330413"
+export TIMER_INTERVAL="3600"  # 1 hour
+export TIMER_ENABLE="true"
 export CLICK_INTERVAL_MS="2400000"
 export HEADLESS="true"
 ```
@@ -50,7 +64,21 @@ Run the script:
 npm run keepalive
 ```
 
-### 3. GitHub Actions
+### 3. Configuration File (Alternative to Environment Variables)
+
+If `FALIX_SERVER_ID` is not set as an environment variable, the script can:
+1. Load it from a `falix.config.json` file in the project root
+2. Prompt for it interactively (local development only)
+
+Example `falix.config.json`:
+```json
+{
+  "serverId": "your-server-id",
+  "FALIX_SERVER_ID": "your-server-id"
+}
+```
+
+### 4. GitHub Actions
 
 The workflow is configured to:
 - Run every 40 minutes via cron schedule (`*/40 * * * *`)
@@ -64,16 +92,30 @@ The workflow is configured to:
 |----------|---------|-------------|
 | `FALIX_EMAIL` | - | Your Falix account email (required) |
 | `FALIX_PASSWORD` | - | Your Falix account password (required) |
+| `FALIX_SERVER_ID` | - | Falix server ID used for both auto-timer requests and browser keepalive (required; falls back to config/prompt when not provided) |
+| `FALIX_TIMER_ID` | - | Legacy timer ID (falls back to `FALIX_SERVER_ID`; kept for backwards compatibility) |
 | `FALIX_BASE_URL` | `https://client.falixnodes.net` | Falix client base URL |
-| `FALIX_TIMER_ID` | `2330413` | Timer ID for the timer page |
-| `CLICK_INTERVAL_MS` | `2400000` | Click interval in milliseconds (40 minutes) |
+| `TIMER_INTERVAL` | `3600` | Auto-timer interval in seconds |
+| `TIMER_ENABLE` | `true` | Set to `false` to disable HTTP-based auto-timer |
+| `CLICK_INTERVAL_MS` | `2400000` | Browser click interval in milliseconds (40 minutes) |
 | `HEADLESS` | `true` | Whether to run browser in headless mode |
 
 ## How It Works
 
+### Auto-Timer (HTTP)
+
+1. **Server ID Resolution**: Obtains server ID from `FALIX_SERVER_ID` environment variable, config file, or interactive prompt
+2. **Periodic HTTP Requests**: Sends authenticated GET requests to `https://client.falixnodes.net/timer?id={serverId}` at the configured interval
+3. **Real Browser Headers**: Includes User-Agent, Accept, Accept-Language, Referer, and other standard browser headers
+4. **Success Verification**: Checks HTTP response status (200-299 = success, 401/403 = auth required)
+5. **Error Handling**: Automatic retry with exponential backoff on network errors or timeouts
+6. **Logging**: Timestamps and status for each request (✓ success, ⚠ warning, ✗ error)
+
+### Browser-Based Keepalive
+
 1. **Login**: The bot logs into your Falix account using the provided credentials
 2. **Cloudflare Detection**: If a Cloudflare challenge appears, the run is skipped so the scheduler can retry later
-3. **Timer Page Navigation**: Navigates to `https://client.falixnodes.net/timer?id={FALIX_TIMER_ID}`
+3. **Timer Page Navigation**: Navigates to `https://client.falixnodes.net/timer?id={serverId}`
 4. **Button Detection**: Searches for the "Add time" button using multiple selector strategies:
    - Text-based matching (supports "Add time" and "添加时间")
    - Data attribute selectors (`[data-testid*="add-time"]`)
@@ -110,6 +152,7 @@ Set `HEADLESS=false` to watch the bot's actions in a visible browser window for 
 
 ## Dependencies
 
+- `axios`: HTTP client for auto-timer requests
 - `puppeteer`: Browser automation
 - `puppeteer-extra`: Enhanced Puppeteer functionality
 - `puppeteer-extra-plugin-stealth`: Avoid detection

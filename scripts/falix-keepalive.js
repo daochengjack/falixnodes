@@ -2,6 +2,8 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs');
 const path = require('path');
+const axios = require('axios');
+const readline = require('readline');
 
 const NAVIGATION_WAIT_UNTIL = 'domcontentloaded';
 const DEFAULT_NAVIGATION_TIMEOUT = 90000;
@@ -9,6 +11,9 @@ const DEFAULT_TIMEOUT = 60000;
 const LOGIN_FORM_TIMEOUT = 45000;
 const DEFAULT_VIEWPORT = { width: 1280, height: 720 };
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const CONFIG_FILE_PATH = path.join(__dirname, '..', 'falix.config.json');
+const TIMER_DEFAULT_INTERVAL_SECONDS = 3600;
+const TIMER_REQUEST_TIMEOUT = 15000;
 const COOKIES_FILE = path.join('/tmp', 'falix-cookies.json');
 const EMAIL_SELECTOR_CANDIDATES = [
   'input[type="email"]',
@@ -132,6 +137,236 @@ function loadCookies() {
   return null;
 }
 
+function loadConfigFile() {
+  try {
+    if (fs.existsSync(CONFIG_FILE_PATH)) {
+      const configData = JSON.parse(fs.readFileSync(CONFIG_FILE_PATH, 'utf-8'));
+      console.log(`Loaded configuration from ${CONFIG_FILE_PATH}`);
+      return configData;
+    }
+  } catch (error) {
+    console.warn(`Failed to load config file: ${error.message}`);
+  }
+  return null;
+}
+
+function saveConfigFile(configData) {
+  try {
+    fs.writeFileSync(CONFIG_FILE_PATH, JSON.stringify(configData, null, 2));
+    console.log(`Configuration saved to ${CONFIG_FILE_PATH}`);
+    return true;
+  } catch (error) {
+    console.error(`Failed to save config file: ${error.message}`);
+    return false;
+  }
+}
+
+async function promptForServerId() {
+  if (process.env.CI || !process.stdin.isTTY) {
+    return null;
+  }
+  
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+  
+  return new Promise((resolve) => {
+    rl.question('Please enter your Falix Server ID: ', (answer) => {
+      rl.close();
+      resolve(answer.trim() || null);
+    });
+  });
+}
+
+async function getServerIdWithFallback() {
+  if (config.FALIX_SERVER_ID) {
+    console.log('Using Server ID from FALIX_SERVER_ID environment variable');
+    return config.FALIX_SERVER_ID;
+  }
+
+  if (config.FALIX_TIMER_ID) {
+    console.log('Using Server ID from FALIX_TIMER_ID environment variable (legacy support)');
+    return config.FALIX_TIMER_ID;
+  }
+
+  const configFile = loadConfigFile();
+  if (configFile) {
+    const candidateKeys = [
+      'serverId',
+      'ServerId',
+      'SERVER_ID',
+      'falixServerId',
+      'falix_server_id',
+      'FALIX_SERVER_ID',
+      'timerId',
+      'FALIX_TIMER_ID'
+    ];
+
+    for (const key of candidateKeys) {
+      if (configFile[key]) {
+        const value = String(configFile[key]).trim();
+        if (value) {
+          console.log(`Using Server ID from config file key "${key}"`);
+          return value;
+        }
+      }
+    }
+  }
+
+  console.log('FALIX_SERVER_ID environment variable not set');
+  const promptedId = await promptForServerId();
+
+  if (promptedId) {
+    console.log('Saving Server ID to config file...');
+    saveConfigFile({ serverId: promptedId, FALIX_SERVER_ID: promptedId });
+    return promptedId;
+  }
+
+  return null;
+}
+
+async function sendTimerRequest(serverId, attempt = 1) {
+  const maxAttempts = 3;
+  const timerUrl = new URL('/timer', config.FALIX_BASE_URL);
+  timerUrl.searchParams.set('id', serverId);
+  const timerUrlString = timerUrl.toString();
+  const timestamp = new Date().toISOString();
+
+  console.log(`[${timestamp}] Sending timer extension request to: ${timerUrlString} (attempt ${attempt}/${maxAttempts})`);
+
+  const cookies = loadCookies();
+  let cookieHeader = null;
+
+  if (Array.isArray(cookies)) {
+    const cookiePairs = cookies
+      .filter(cookie => cookie && cookie.name && cookie.value)
+      .map(cookie => `${cookie.name}=${cookie.value}`);
+
+    if (cookiePairs.length > 0) {
+      cookieHeader = cookiePairs.join('; ');
+    }
+  }
+
+  const headers = {
+    'User-Agent': DEFAULT_USER_AGENT,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-User': '?1',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+    'Referer': timerUrlString
+  };
+
+  if (cookieHeader) {
+    headers.Cookie = cookieHeader;
+  }
+
+  try {
+    const response = await axios.get(timerUrlString, {
+      timeout: TIMER_REQUEST_TIMEOUT,
+      headers,
+      validateStatus: (status) => status >= 200 && status < 500
+    });
+
+    const successTimestamp = new Date().toISOString();
+
+    if (response.status >= 200 && response.status < 300) {
+      console.log(`[${successTimestamp}] ✓ Timer extension request successful (status: ${response.status})`);
+      return { success: true, status: response.status, timestamp: successTimestamp };
+    }
+
+    if (response.status === 401 || response.status === 403) {
+      console.warn(`[${successTimestamp}] ⚠ Timer request returned ${response.status} - Authentication may be required`);
+      return { success: false, status: response.status, authRequired: true, timestamp: successTimestamp };
+    }
+
+    console.warn(`[${successTimestamp}] ⚠ Timer request returned unexpected status: ${response.status}`);
+    return { success: false, status: response.status, timestamp: successTimestamp };
+  } catch (error) {
+    const errorTimestamp = new Date().toISOString();
+    const message = error && error.message ? error.message : 'Unknown error';
+
+    if (error && (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT')) {
+      console.error(`[${errorTimestamp}] ✗ Timer request timed out: ${message}`);
+    } else if (error && error.response) {
+      console.error(`[${errorTimestamp}] ✗ Timer request failed with status ${error.response.status}: ${message}`);
+    } else if (error && error.request) {
+      console.error(`[${errorTimestamp}] ✗ Timer request failed - no response received: ${message}`);
+    } else {
+      console.error(`[${errorTimestamp}] ✗ Timer request error: ${message}`);
+    }
+
+    if (attempt < maxAttempts) {
+      const backoffMs = 2000 + (attempt - 1) * 1000 + Math.random() * 1000;
+      console.log(`Retrying in ${Math.round(backoffMs)}ms... (attempt ${attempt + 1}/${maxAttempts})`);
+      await new Promise(resolve => setTimeout(resolve, backoffMs));
+      return sendTimerRequest(serverId, attempt + 1);
+    }
+
+    return { success: false, error: message, timestamp: errorTimestamp };
+  }
+}
+
+let autoTimerInterval = null;
+
+async function startAutoTimer(serverId) {
+  if (!config.TIMER_ENABLE) {
+    console.log('Auto-timer is disabled (TIMER_ENABLE=false)');
+    return;
+  }
+  
+  if (!serverId) {
+    console.warn('⚠ Auto-timer cannot start: Server ID not available');
+    return;
+  }
+  
+  const intervalSeconds = config.TIMER_INTERVAL_SECONDS;
+  const intervalMs = config.TIMER_INTERVAL_MS;
+  
+  console.log(`\n=== Starting Auto-Timer ===`);
+  console.log(`Server ID: ${serverId}`);
+  console.log(`Interval: ${intervalSeconds} seconds (${intervalSeconds / 60} minutes)`);
+  console.log(`Timer endpoint: ${config.FALIX_BASE_URL}/timer?id=${serverId}`);
+  
+  const executeTimerRequest = async () => {
+    try {
+      const result = await sendTimerRequest(serverId);
+      if (result.success) {
+        console.log(`✓ Auto-timer successfully extended server time`);
+      } else if (result.authRequired) {
+        console.log(`⚠ Auto-timer failed: Authentication required. Browser-based keepalive will handle this.`);
+      } else {
+        console.log(`✗ Auto-timer request failed - will retry on next interval`);
+      }
+    } catch (error) {
+      console.error(`Auto-timer execution error: ${error.message}`);
+    }
+  };
+  
+  await executeTimerRequest();
+  
+  autoTimerInterval = setInterval(async () => {
+    await executeTimerRequest();
+  }, intervalMs);
+  
+  console.log(`Auto-timer started - will run every ${intervalSeconds} seconds`);
+}
+
+function stopAutoTimer() {
+  if (autoTimerInterval) {
+    clearInterval(autoTimerInterval);
+    autoTimerInterval = null;
+    console.log('Auto-timer stopped');
+  }
+}
+
 async function withRetry(fn, options) {
   const { retries, onFailedAttempt } = options;
   for (let i = 0; i <= retries; i++) {
@@ -158,13 +393,48 @@ puppeteer.use(StealthPlugin());
 const DEFAULT_BASE_URL = 'https://client.falixnodes.net';
 const normalizedBaseUrl = (process.env.FALIX_BASE_URL || DEFAULT_BASE_URL).replace(/\/+$/, '');
 
+function parseBooleanEnv(value, defaultValue = true) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['false', '0', 'no', 'n', 'off'].includes(normalized)) {
+    return false;
+  }
+  return defaultValue;
+}
+
+function parsePositiveIntEnv(value, defaultValue) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return parsed;
+  }
+
+  return defaultValue;
+}
+
+const timerIntervalSeconds = parsePositiveIntEnv(process.env.TIMER_INTERVAL, TIMER_DEFAULT_INTERVAL_SECONDS);
+const clickIntervalMs = parsePositiveIntEnv(process.env.CLICK_INTERVAL_MS, 2400000);
+
 const config = {
   FALIX_EMAIL: process.env.FALIX_EMAIL,
   FALIX_PASSWORD: process.env.FALIX_PASSWORD,
   FALIX_BASE_URL: normalizedBaseUrl,
-  FALIX_TIMER_ID: process.env.FALIX_TIMER_ID || '2330413',
-  CLICK_INTERVAL_MS: parseInt(process.env.CLICK_INTERVAL_MS) || 2400000,
-  HEADLESS: process.env.HEADLESS !== 'false'
+  FALIX_TIMER_ID: process.env.FALIX_TIMER_ID ? String(process.env.FALIX_TIMER_ID).trim() : null,
+  FALIX_SERVER_ID: process.env.FALIX_SERVER_ID ? String(process.env.FALIX_SERVER_ID).trim() : null,
+  TIMER_INTERVAL_SECONDS: timerIntervalSeconds,
+  TIMER_INTERVAL_MS: timerIntervalSeconds * 1000,
+  TIMER_ENABLE: parseBooleanEnv(process.env.TIMER_ENABLE, true),
+  CLICK_INTERVAL_MS: clickIntervalMs,
+  HEADLESS: parseBooleanEnv(process.env.HEADLESS, true)
 };
 
 if (!config.FALIX_EMAIL || !config.FALIX_PASSWORD) {
@@ -1261,6 +1531,7 @@ async function performTimerKeepalive() {
 
 async function cleanup() {
   console.log('Cleaning up...');
+  stopAutoTimer();
   if (browser) {
     await randomDelay(800, 1500);
     console.log('Closing browser...');
@@ -1269,23 +1540,46 @@ async function cleanup() {
 }
 
 async function main() {
+  let serverId = null;
+  
   try {
-    console.log('\n=== Starting Falix Timer Keepalive ===');
-    console.log(`Timer ID: ${config.FALIX_TIMER_ID}`);
+    console.log('\n=== Starting Falix Keepalive Service ===');
+    console.log(`Base URL: ${config.FALIX_BASE_URL}`);
     console.log(`Click interval: ${config.CLICK_INTERVAL_MS}ms (${config.CLICK_INTERVAL_MS / 60000} minutes)`);
     
+    serverId = await getServerIdWithFallback();
+    
+    if (!serverId) {
+      throw new Error('Falix Server ID is required. Set FALIX_SERVER_ID or create a falix.config.json file.');
+    }
+    
+    config.FALIX_SERVER_ID = serverId;
+    config.FALIX_TIMER_ID = serverId;
+    
+    console.log(`Resolved Server ID: ${serverId}`);
+    console.log(`Timer ID: ${config.FALIX_TIMER_ID}`);
+    console.log(`Auto-timer: ${config.TIMER_ENABLE ? `enabled (interval: ${config.TIMER_INTERVAL_SECONDS} seconds)` : 'disabled'}`);
+    
+    console.log('\n=== Starting Browser-Based Keepalive ===');
     await initializeBrowser();
     await login();
+    
+    if (config.TIMER_ENABLE) {
+      console.log('\n=== Starting Auto-Timer Service ===');
+      await startAutoTimer(serverId);
+    } else {
+      console.log('\nAuto-timer disabled. Skipping HTTP timer requests.');
+    }
     
     const result = await performTimerKeepalive();
     
     if (result.success) {
-      console.log('\n=== Timer keepalive completed successfully ===');
+      console.log('\n=== Browser-based keepalive completed successfully ===');
       if (result.verified === false) {
         console.log('Note: Success could not be fully verified, but click was executed');
       }
     } else {
-      console.error('\n=== Timer keepalive failed ===');
+      console.error('\n=== Browser-based keepalive failed ===');
       throw new Error('Timer keepalive operation failed');
     }
   } catch (error) {
@@ -1295,7 +1589,7 @@ async function main() {
       console.log('Skipping run so the scheduler can retry later.');
       return;
     }
-    console.error('Fatal error in timer keepalive workflow:', error);
+    console.error('Fatal error in keepalive workflow:', error);
     throw error;
   } finally {
     await cleanup();
@@ -1304,12 +1598,14 @@ async function main() {
 
 process.on('SIGINT', async () => {
   console.log('\nReceived SIGINT, cleaning up...');
+  stopAutoTimer();
   await cleanup();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
   console.log('\nReceived SIGTERM, cleaning up...');
+  stopAutoTimer();
   await cleanup();
   process.exit(0);
 });
