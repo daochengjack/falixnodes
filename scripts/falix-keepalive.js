@@ -1,13 +1,15 @@
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs');
+const path = require('path');
 
 const NAVIGATION_WAIT_UNTIL = 'domcontentloaded';
 const DEFAULT_NAVIGATION_TIMEOUT = 90000;
 const DEFAULT_TIMEOUT = 60000;
 const LOGIN_FORM_TIMEOUT = 45000;
-const DEFAULT_VIEWPORT = { width: 1366, height: 768 };
+const DEFAULT_VIEWPORT = { width: 1280, height: 720 };
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const COOKIES_FILE = path.join('/tmp', 'falix-cookies.json');
 const EMAIL_SELECTOR_CANDIDATES = [
   'input[type="email"]',
   'input[name="email"]',
@@ -53,6 +55,81 @@ class CloudflareChallengeError extends Error {
     super(message);
     this.name = 'CloudflareChallengeError';
   }
+}
+
+async function randomDelay(minMs = 1000, maxMs = 3000) {
+  const delay = Math.random() * (maxMs - minMs) + minMs;
+  await new Promise(resolve => setTimeout(resolve, delay));
+  return delay;
+}
+
+async function moveMouseAndClick(frame, selector, options = {}) {
+  try {
+    const element = await frame.$(selector);
+    if (!element) {
+      throw new Error(`Element not found: ${selector}`);
+    }
+
+    const boundingBox = await element.boundingBox();
+    if (!boundingBox) {
+      throw new Error(`Cannot get bounding box for ${selector}`);
+    }
+
+    const x = boundingBox.x + boundingBox.width / 2;
+    const y = boundingBox.y + boundingBox.height / 2;
+
+    console.log(`Moving mouse to coordinates (${Math.round(x)}, ${Math.round(y)})...`);
+    await frame.mouse.move(x, y);
+    
+    const pauseMs = 200 + Math.random() * 300;
+    await new Promise(resolve => setTimeout(resolve, pauseMs));
+
+    console.log(`Clicking element: ${selector}`);
+    await element.click(options);
+
+    return true;
+  } catch (error) {
+    console.log(`moveMouseAndClick failed for ${selector}: ${error.message}`);
+    return false;
+  }
+}
+
+async function scrollPage(scrollAmount = 300) {
+  try {
+    await page.evaluate((amount) => {
+      window.scrollBy(0, amount);
+    }, scrollAmount);
+    
+    const pauseMs = 300 + Math.random() * 400;
+    await new Promise(resolve => setTimeout(resolve, pauseMs));
+    
+    return true;
+  } catch (error) {
+    console.log(`Scroll failed: ${error.message}`);
+    return false;
+  }
+}
+
+function saveCookies(cookies) {
+  try {
+    fs.writeFileSync(COOKIES_FILE, JSON.stringify(cookies, null, 2));
+    console.log(`Cookies saved to ${COOKIES_FILE}`);
+  } catch (error) {
+    console.warn(`Failed to save cookies: ${error.message}`);
+  }
+}
+
+function loadCookies() {
+  try {
+    if (fs.existsSync(COOKIES_FILE)) {
+      const cookies = JSON.parse(fs.readFileSync(COOKIES_FILE, 'utf-8'));
+      console.log(`Loaded ${cookies.length} cookies from ${COOKIES_FILE}`);
+      return cookies;
+    }
+  } catch (error) {
+    console.warn(`Failed to load cookies: ${error.message}`);
+  }
+  return null;
 }
 
 async function withRetry(fn, options) {
@@ -499,6 +576,7 @@ async function waitForPostSubmitOutcome(timeout = 60000) {
 async function submitLoginForm(emailElement, passwordElement, submitElement) {
   console.log('Preparing to submit login form...');
   
+  await randomDelay(800, 1500);
   await captureDiagnosticInfo('pre-submit');
   
   console.log('Scrolling email field into view...');
@@ -506,14 +584,14 @@ async function submitLoginForm(emailElement, passwordElement, submitElement) {
   if (!emailCheck.visible || !emailCheck.enabled) {
     console.warn(`Email field visibility: ${emailCheck.visible}, enabled: ${emailCheck.enabled}`);
   }
-  await emailElement.frame.waitForTimeout(300);
+  await randomDelay(300, 600);
   
   console.log('Scrolling password field into view...');
   const passwordCheck = await scrollIntoViewAndCheck(passwordElement.frame, passwordElement.selector);
   if (!passwordCheck.visible || !passwordCheck.enabled) {
     console.warn(`Password field visibility: ${passwordCheck.visible}, enabled: ${passwordCheck.enabled}`);
   }
-  await passwordElement.frame.waitForTimeout(300);
+  await randomDelay(300, 600);
   
   if (submitElement) {
     console.log('Scrolling submit button into view...');
@@ -521,20 +599,21 @@ async function submitLoginForm(emailElement, passwordElement, submitElement) {
     if (!submitCheck.visible || !submitCheck.enabled) {
       console.warn(`Submit button visibility: ${submitCheck.visible}, enabled: ${submitCheck.enabled}`);
     }
-    await submitElement.frame.waitForTimeout(300);
+    await randomDelay(300, 600);
   }
   
   console.log('Typing credentials with delays...');
-  await emailElement.frame.focus(emailElement.selector).catch(() => {});
-  await emailElement.frame.click(emailElement.selector, { clickCount: 3 }).catch(() => {});
-  await emailElement.frame.waitForTimeout(100);
-  await emailElement.frame.type(emailElement.selector, config.FALIX_EMAIL, { delay: 50 });
-  await emailElement.frame.waitForTimeout(200);
+  await moveMouseAndClick(emailElement.frame, emailElement.selector).catch(() => {});
+  await randomDelay(200, 400);
   
-  await passwordElement.frame.focus(passwordElement.selector).catch(() => {});
-  await passwordElement.frame.waitForTimeout(100);
-  await passwordElement.frame.type(passwordElement.selector, config.FALIX_PASSWORD, { delay: 50 });
-  await passwordElement.frame.waitForTimeout(300);
+  await emailElement.frame.type(emailElement.selector, config.FALIX_EMAIL, { delay: 50 + Math.random() * 30 });
+  await randomDelay(400, 800);
+  
+  await moveMouseAndClick(passwordElement.frame, passwordElement.selector).catch(() => {});
+  await randomDelay(200, 400);
+  
+  await passwordElement.frame.type(passwordElement.selector, config.FALIX_PASSWORD, { delay: 50 + Math.random() * 30 });
+  await randomDelay(500, 1000);
   
   const challenge = await detectChallengeOrBlock();
   if (challenge.detected) {
@@ -548,12 +627,20 @@ async function submitLoginForm(emailElement, passwordElement, submitElement) {
   
   if (submitElement) {
     try {
-      console.log('Attempting regular click on submit button...');
-      await submitElement.frame.click(submitElement.selector);
-      submitSuccess = true;
-      console.log('Submit button clicked successfully');
+      console.log('Attempting click on submit button with mouse movement...');
+      const mouseClickSuccess = await moveMouseAndClick(submitElement.frame, submitElement.selector);
+      
+      if (mouseClickSuccess) {
+        submitSuccess = true;
+        console.log('Submit button clicked successfully with mouse movement');
+      } else {
+        console.log('Mouse click failed, trying regular click...');
+        await submitElement.frame.click(submitElement.selector);
+        submitSuccess = true;
+        console.log('Submit button clicked with regular click');
+      }
     } catch (clickError) {
-      console.log(`Regular click failed: ${clickError.message}, trying page.evaluate...`);
+      console.log(`Click failed: ${clickError.message}, trying page.evaluate...`);
       
       try {
         submitSuccess = await submitElement.frame.evaluate((sel) => {
@@ -578,6 +665,7 @@ async function submitLoginForm(emailElement, passwordElement, submitElement) {
     console.log('Submit button click failed or not available, pressing Enter on password field...');
     try {
       await passwordElement.frame.focus(passwordElement.selector);
+      await randomDelay(200, 400);
       await passwordElement.frame.keyboard.press('Enter');
       submitSuccess = true;
       console.log('Pressed Enter on password field');
@@ -587,7 +675,7 @@ async function submitLoginForm(emailElement, passwordElement, submitElement) {
     }
   }
   
-  await page.waitForTimeout(1000);
+  await randomDelay(1000, 2000);
   
   return submitSuccess;
 }
@@ -627,7 +715,7 @@ async function handleRedirects() {
     });
     
     if (loginButtonFound) {
-      await page.waitForTimeout(500);
+      await randomDelay(400, 800);
       await waitForLoginFormReady();
       console.log('Clicked login button by text content');
       return true;
@@ -636,11 +724,13 @@ async function handleRedirects() {
     for (const selector of loginSelectors) {
       try {
         await page.waitForSelector(selector, { timeout: 5000 });
-        await page.click(selector);
-        await page.waitForTimeout(300);
-        await waitForLoginFormReady();
-        console.log(`Clicked login element: ${selector}`);
-        return true;
+        const mouseSuccess = await moveMouseAndClick(page, selector);
+        if (mouseSuccess) {
+          await randomDelay(300, 600);
+          await waitForLoginFormReady();
+          console.log(`Clicked login element: ${selector}`);
+          return true;
+        }
       } catch (error) {
         console.log(`Redirect handler attempt for ${selector} failed: ${error.message}`);
       }
@@ -657,6 +747,32 @@ async function login() {
     console.log('Attempting to login...');
     
     try {
+      const savedCookies = loadCookies();
+      if (savedCookies && savedCookies.length > 0) {
+        console.log('Trying to use saved session cookies...');
+        try {
+          await page.setCookie(...savedCookies);
+          console.log('Cookies loaded, navigating to keep-alive endpoint...');
+          
+          const timerUrl = `${config.FALIX_BASE_URL}/timer?id=${config.FALIX_TIMER_ID}`;
+          try {
+            await gotoWithRetry(timerUrl, { waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT });
+            const currentUrl = page.url();
+            
+            if (!currentUrl.includes('/auth')) {
+              console.log('Session is still valid, skipping login');
+              return;
+            }
+          } catch (error) {
+            console.log('Cookie session expired or invalid, proceeding with login');
+          }
+        } catch (error) {
+          console.log(`Failed to apply saved cookies: ${error.message}`);
+        }
+      }
+      
+      await randomDelay(1000, 2000);
+      console.log('Navigating to login page...');
       await gotoWithRetry(loginUrl, { waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT });
       await ensureNoCloudflareChallenge('login navigation');
 
@@ -784,6 +900,10 @@ async function login() {
       
       console.log('Login completed successfully');
       
+      await randomDelay(500, 1000);
+      const cookies = await page.cookies();
+      saveCookies(cookies);
+      
     } catch (error) {
       if (error instanceof CloudflareChallengeError) {
         throw error;
@@ -896,7 +1016,35 @@ async function findAddTimeButton() {
 }
 
 async function clickAddTimeButton() {
-  console.log('Attempting to click Add time button...');
+  console.log('Attempting to click Add time button with human-like behavior...');
+  
+  await scrollPage(Math.random() * 150 + 100);
+  await randomDelay(300, 600);
+  
+  const selectorCandidates = [
+    '[data-testid*="add-time"]',
+    '[data-testid*="addtime"]',
+    '.add-time',
+    '.add-time-btn',
+    'button[class*="add-time" i]',
+    'button[class*="addtime" i]'
+  ];
+  
+  for (const selector of selectorCandidates) {
+    try {
+      const element = await page.$(selector);
+      if (element) {
+        console.log(`Found add-time button with selector: ${selector}`);
+        const success = await moveMouseAndClick(page, selector);
+        if (success) {
+          console.log(`Add time button clicked successfully using ${selector}`);
+          return true;
+        }
+      }
+    } catch (error) {
+      console.log(`Attempt to click ${selector} failed: ${error.message}`);
+    }
+  }
   
   const clicked = await page.evaluate(() => {
     const buttonTextMatchers = ['add time', '添加时间'];
@@ -909,23 +1057,6 @@ async function clickAddTimeButton() {
           btn.click();
           return { success: true, method: 'text-match' };
         }
-      }
-    }
-    
-    const selectorCandidates = [
-      '[data-testid*="add-time"]',
-      '[data-testid*="addtime"]',
-      '.add-time',
-      '.add-time-btn',
-      'button[class*="add-time" i]',
-      'button[class*="addtime" i]'
-    ];
-    
-    for (const selector of selectorCandidates) {
-      const element = document.querySelector(selector);
-      if (element && typeof element.click === 'function') {
-        element.click();
-        return { success: true, method: `selector-${selector}` };
       }
     }
     
@@ -943,7 +1074,7 @@ async function clickAddTimeButton() {
 
 async function verifyAddTimeSuccess() {
   console.log('Verifying Add time button click success...');
-  await page.waitForTimeout(2000);
+  await randomDelay(1500, 2500);
   
   const verification = await page.evaluate(() => {
     const toastSelectors = [
@@ -1050,10 +1181,13 @@ async function performTimerKeepalive() {
   try {
     await gotoWithRetry(timerUrl, { waitUntil: NAVIGATION_WAIT_UNTIL, timeout: DEFAULT_NAVIGATION_TIMEOUT });
     await ensureNoCloudflareChallenge('timer page navigation');
-    await page.waitForTimeout(2000);
+    await randomDelay(1500, 2500);
     
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] Timer page loaded, searching for Add time button...`);
+    
+    await scrollPage(150 + Math.random() * 200);
+    await randomDelay(300, 600);
     
     const buttonFound = await findAddTimeButton();
     if (!buttonFound) {
@@ -1073,13 +1207,15 @@ async function performTimerKeepalive() {
     for (let attempt = 1; attempt <= retryConfig.maxAttempts; attempt++) {
       console.log(`Click attempt ${attempt}/${retryConfig.maxAttempts}...`);
       
+      await randomDelay(200, 400);
       clicked = await clickAddTimeButton();
       
       if (!clicked) {
         console.log(`Failed to click on attempt ${attempt}`);
         if (attempt < retryConfig.maxAttempts) {
-          console.log(`Waiting ${retryConfig.backoffMs}ms before retry...`);
-          await page.waitForTimeout(retryConfig.backoffMs);
+          const backoffMs = retryConfig.backoffMs + Math.random() * 1000;
+          console.log(`Waiting ${Math.round(backoffMs)}ms before retry...`);
+          await randomDelay(backoffMs, backoffMs + 500);
           continue;
         }
         break;
@@ -1090,13 +1226,15 @@ async function performTimerKeepalive() {
       if (verified) {
         const successTimestamp = new Date().toISOString();
         console.log(`[${successTimestamp}] Add time click verified successfully on attempt ${attempt}`);
+        await randomDelay(500, 1000);
         return { success: true, attempts: attempt };
       }
       
       console.log(`Verification failed on attempt ${attempt}`);
       if (attempt < retryConfig.maxAttempts) {
-        console.log(`Waiting ${retryConfig.backoffMs}ms before retry...`);
-        await page.waitForTimeout(retryConfig.backoffMs);
+        const backoffMs = retryConfig.backoffMs + Math.random() * 1000;
+        console.log(`Waiting ${Math.round(backoffMs)}ms before retry...`);
+        await randomDelay(backoffMs, backoffMs + 500);
       }
     }
     
@@ -1124,6 +1262,8 @@ async function performTimerKeepalive() {
 async function cleanup() {
   console.log('Cleaning up...');
   if (browser) {
+    await randomDelay(800, 1500);
+    console.log('Closing browser...');
     await browser.close();
   }
 }
